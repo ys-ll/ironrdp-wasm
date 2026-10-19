@@ -1,5 +1,5 @@
 diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
-index 1feb838..1281a1f 100644
+index 1feb838..337f6ee 100644
 --- a/crates/ironrdp-web/src/session.rs
 +++ b/crates/ironrdp-web/src/session.rs
 @@ -96,6 +96,7 @@ struct SessionBuilderInner {
@@ -26,7 +26,23 @@ index 1feb838..1281a1f 100644
              |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
              |enable_standard_rdp_security: bool| {
                  self.0.borrow_mut().enable_standard_rdp_security = enable_standard_rdp_security;
-@@ -442,6 +445,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -375,6 +378,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             printer_driver_name,
+             outbound_message_size_limit,
+             legacy_graphics,
++            autologon,
+             security,
+         );
+ 
+@@ -419,6 +423,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             printer_driver_name = inner.printer_driver_name.clone();
+             outbound_message_size_limit = inner.outbound_message_size_limit;
+             legacy_graphics = inner.legacy_graphics;
++            autologon = inner.autologon;
+             security = SecurityConfig {
+                 enable_credssp: inner.enable_credssp,
+                 enable_standard_rdp_security: inner.enable_standard_rdp_security,
+@@ -442,6 +447,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
              client_name.clone(),
              desktop_size,
              legacy_graphics,
@@ -34,7 +50,7 @@ index 1feb838..1281a1f 100644
              security,
          );
  
-@@ -1477,6 +1481,7 @@ fn build_config(
+@@ -1477,6 +1483,7 @@ fn build_config(
      client_name: String,
      desktop_size: DesktopSize,
      legacy_graphics: bool,
@@ -42,7 +58,7 @@ index 1feb838..1281a1f 100644
      security: SecurityConfig,
  ) -> connector::Config {
      // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
-@@ -1528,7 +1533,7 @@ fn build_config(
+@@ -1528,7 +1535,7 @@ fn build_config(
          platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
          compression_type: None,
          enable_server_pointer: true,
