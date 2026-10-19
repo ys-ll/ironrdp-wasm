@@ -40,6 +40,13 @@ jobs:
           echo "IRONRDP_SHA=${IRONRDP_SHA}" >> "$GITHUB_ENV"
           echo "IronRDP pinned at ${IRONRDP_SHA}"
 
+      - name: Apply uniTerm patches
+        run: |
+          for p in patches/*.patch; do
+            echo "Applying $p"
+            git -C ironrdp apply --whitespace=nowarn "$GITHUB_WORKSPACE/$p"
+          done
+
       - name: Build ironrdp-web for WASM
         run: wasm-pack build ironrdp/crates/ironrdp-web --target web --release --out-dir "$GITHUB_WORKSPACE/pkg" --out-name ironrdp
 

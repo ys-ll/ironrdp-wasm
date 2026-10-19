@@ -1,0 +1,53 @@
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+index 1feb838..1281a1f 100644
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -96,6 +96,7 @@ struct SessionBuilderInner {
+     printer_driver_name: Option<String>,
+ 
+     use_display_control: bool,
++    autologon: bool,
+     enable_credssp: bool,
+     enable_standard_rdp_security: bool,
+     enable_server_pointer: bool,
+@@ -141,6 +142,7 @@ impl Default for SessionBuilderInner {
+             printer_driver_name: None,
+ 
+             use_display_control: false,
++            autologon: false,
+             enable_credssp: true,
+             enable_standard_rdp_security: false,
+             enable_server_pointer: true,
+@@ -262,6 +264,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
+             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
+             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
++            |autologon: bool| { self.0.borrow_mut().autologon = autologon };
+             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
+             |enable_standard_rdp_security: bool| {
+                 self.0.borrow_mut().enable_standard_rdp_security = enable_standard_rdp_security;
+@@ -442,6 +445,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             client_name.clone(),
+             desktop_size,
+             legacy_graphics,
++            autologon,
+             security,
+         );
+ 
+@@ -1477,6 +1481,7 @@ fn build_config(
+     client_name: String,
+     desktop_size: DesktopSize,
+     legacy_graphics: bool,
++    autologon: bool,
+     security: SecurityConfig,
+ ) -> connector::Config {
+     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
+@@ -1528,7 +1533,7 @@ fn build_config(
+         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
+         compression_type: None,
+         enable_server_pointer: true,
+-        autologon: false,
++        autologon,
+         enable_audio_playback: false,
+         enable_audio_capture: false,
+         request_data: None,
