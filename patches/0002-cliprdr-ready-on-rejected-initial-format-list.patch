@@ -1,0 +1,24 @@
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index d74a3ed..b577ff8 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -707,9 +707,18 @@ impl<R: Role> Cliprdr<R> {
+             FormatListResponse::Fail => {
+                 // [MS-RDPECLIP] 3.1.5.2.4 - The remote rejected our FormatList but the
+                 // channel remains operational. Clear local state so we don't serve stale
+-                // data, but stay in Ready state to allow subsequent clipboard operations.
++                // data. Some servers (2008 R2) reject the initial (empty) format list,
++                // which would otherwise leave the channel stuck in Initialization and
++                // make every later initiate_copy fail with "not in Ready state" — so
++                // treat any response as completing the initialization handshake.
+                 warn!("Remote rejected our format list, clearing local clipboard state");
+ 
++                if self.state == CliprdrState::Initialization {
++                    debug!("Clipboard virtual channel initialized (via rejected initial format list)");
++                    self.state = CliprdrState::Ready;
++                    self.backend.on_ready();
++                }
++
+                 self.local_file_list = None;
+                 self.local_file_list_format_id = None;
+                 self.local_drop_effect_format_id = None;
