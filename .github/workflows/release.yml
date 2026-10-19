@@ -1,0 +1,86 @@
+name: release
+
+# Builds Devolutions/IronRDP's ironrdp-web crate (the WASM RDP client) with
+# wasm-pack and publishes the wasm-bindgen pkg/ as an npm tarball attached to
+# a GitHub Release. uniTerm installs it as a URL dependency pointing at that
+# release asset — no npm registry account required.
+#
+# Trigger: push a tag v* (the tag name minus the v prefix becomes the npm
+# package version), or run manually from the Actions tab.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  IRONRDP_REPO: https://github.com/Devolutions/IronRDP
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Checkout IronRDP (master HEAD, SHA recorded in release)
+        run: |
+          git clone --depth 1 ${IRONRDP_REPO} ironrdp
+          IRONRDP_SHA=$(git -C ironrdp rev-parse HEAD)
+          echo "IRONRDP_SHA=${IRONRDP_SHA}" >> "$GITHUB_ENV"
+          echo "IronRDP pinned at ${IRONRDP_SHA}"
+
+      - name: Build ironrdp-web for WASM
+        run: wasm-pack build ironrdp/crates/ironrdp-web --target web --release --out-dir "$GITHUB_WORKSPACE/pkg" --out-name ironrdp
+
+      - name: Rebrand package as @ys-ll/ironrdp-wasm
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('pkg/package.json', 'utf8'));
+            p.name = '@ys-ll/ironrdp-wasm';
+            p.version = process.env.VERSION.replace(/^v/, '');
+            p.description = 'IronRDP WASM client (ironrdp-web) built for uniTerm';
+            p.files = ['ironrdp.js', 'ironrdp.d.ts', 'ironrdp_bg.wasm', 'ironrdp_bg.wasm.d.ts', 'snippets'];
+            p.main = 'ironrdp.js';
+            p.types = 'ironrdp.d.ts';
+            fs.writeFileSync('pkg/package.json', JSON.stringify(p, null, 2));
+          "
+          cat pkg/package.json
+
+      - name: Pack
+        run: |
+          cd pkg
+          npm pack --pack-destination "$GITHUB_WORKSPACE"
+          cd ..
+          TARBALL=$(ls ys-ll-ironrdp-wasm-*.tgz)
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Create release and upload tarball
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Built from Devolutions/IronRDP @ ${IRONRDP_SHA}" \
+            "$TARBALL"
+
+      - name: Upload artifact (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARBALL }}
+          path: ${{ env.TARBALL }}
