@@ -80,10 +80,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Built from Devolutions/IronRDP @ ${IRONRDP_SHA}" \
-            "$TARBALL"
+          # Pre-release tags (e.g. v1.2.3-test.1) produce pre-releases, per
+          # semver: a hyphen in the version marks a pre-release.
+          flags=(--title "$GITHUB_REF_NAME" --notes "Built from Devolutions/IronRDP @ ${IRONRDP_SHA}")
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" "$TARBALL"
 
       - name: Upload artifact (manual runs)
         if: github.ref_type != 'tag'
