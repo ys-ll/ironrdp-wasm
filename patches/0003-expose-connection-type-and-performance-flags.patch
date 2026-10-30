@@ -1,0 +1,95 @@
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+index 1feb838..bb02477 100644
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -101,6 +101,8 @@ struct SessionBuilderInner {
+     enable_server_pointer: bool,
+     legacy_graphics: bool,
+     outbound_message_size_limit: Option<usize>,
++    connection_type: Option<u32>,
++    performance_flags: Option<u32>,
+ }
+ 
+ impl Default for SessionBuilderInner {
+@@ -146,6 +148,8 @@ impl Default for SessionBuilderInner {
+             enable_server_pointer: true,
+             legacy_graphics: false,
+             outbound_message_size_limit: None,
++            connection_type: None,
++            performance_flags: None,
+         }
+     }
+ }
+@@ -268,6 +272,26 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             };
+             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
+             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
++            |connection_type: f64| {
++                let value = if connection_type >= 1.0 && connection_type <= 7.0 {
++                    #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
++                    { Some(connection_type as u32) }
++                } else {
++                    warn!(connection_type, "Invalid connection_type; ignoring (valid range 1-7)");
++                    None
++                };
++                self.0.borrow_mut().connection_type = value;
++            };
++            |performance_flags: f64| {
++                let value = if performance_flags >= 0.0 && performance_flags <= f64::from(u32::MAX) {
++                    #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
++                    { Some(performance_flags as u32) }
++                } else {
++                    warn!(performance_flags, "Invalid performance_flags; ignoring");
++                    None
++                };
++                self.0.borrow_mut().performance_flags = value;
++            };
+             |outbound_message_size_limit: f64| {
+                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
+                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+@@ -448,6 +472,22 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+         let enable_server_pointer = self.0.borrow().enable_server_pointer;
+         config.enable_server_pointer = enable_server_pointer;
+ 
++        // Optional network profile overrides (uniTerm low-bandwidth tiers):
++        // connection_type is honored by the server only together with the
++        // VALID_CONNECTION_TYPE early capability flag, which the connector
++        // already sets unconditionally.
++        {
++            let inner = self.0.borrow();
++            if let Some(connection_type) = inner.connection_type.and_then(connection_type_from_u32) {
++                config.connection_type = connection_type;
++            }
++            if let Some(performance_flags) = inner.performance_flags {
++                // Unknown bits are ignored rather than rejected, so callers can
++                // pass raw MS-RDPBCGR TS_PERF flag values.
++                config.performance_flags = PerformanceFlags::from_bits_truncate(performance_flags);
++            }
++        }
++
+         let (input_events_tx, input_events_rx) = mpsc::unbounded();
+ 
+         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
+@@ -1470,6 +1510,22 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
+     Ok(file_list)
+ }
+ 
++/// Map a raw TS_CONNECTION_TYPE value (MS-RDPBCGR 2.2.1.11.1.1.1.1) to the
++/// GCC enum; unknown values fall back to `None` and keep the default.
++fn connection_type_from_u32(value: u32) -> Option<ironrdp::pdu::gcc::ConnectionType> {
++    match value {
++        0 => Some(ironrdp::pdu::gcc::ConnectionType::NotUsed),
++        1 => Some(ironrdp::pdu::gcc::ConnectionType::Modem),
++        2 => Some(ironrdp::pdu::gcc::ConnectionType::BroadbandLow),
++        3 => Some(ironrdp::pdu::gcc::ConnectionType::Satellite),
++        4 => Some(ironrdp::pdu::gcc::ConnectionType::BroadbandHigh),
++        5 => Some(ironrdp::pdu::gcc::ConnectionType::Wan),
++        6 => Some(ironrdp::pdu::gcc::ConnectionType::Lan),
++        7 => Some(ironrdp::pdu::gcc::ConnectionType::Autodetect),
++        _ => None,
++    }
++}
++
+ fn build_config(
+     username: String,
+     password: String,
