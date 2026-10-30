@@ -18,6 +18,10 @@ permissions:
 
 env:
   IRONRDP_REPO: https://github.com/Devolutions/IronRDP
+  # Pinned known-good IronRDP revision. Newer upstream commits can break the
+  # protocol against real servers — bump this deliberately after testing a
+  # fresh checkout, never implicitly via master HEAD.
+  IRONRDP_SHA: 62246b364a0282bab85087f658a81fe4207b6b31
 
 jobs:
   build:
@@ -33,11 +37,11 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
 
-      - name: Checkout IronRDP (master HEAD, SHA recorded in release)
+      - name: Checkout IronRDP (pinned SHA, recorded in release)
         run: |
-          git clone --depth 1 ${IRONRDP_REPO} ironrdp
-          IRONRDP_SHA=$(git -C ironrdp rev-parse HEAD)
-          echo "IRONRDP_SHA=${IRONRDP_SHA}" >> "$GITHUB_ENV"
+          git clone --no-checkout --filter=blob:none ${IRONRDP_REPO} ironrdp
+          git -C ironrdp fetch --depth 1 origin ${IRONRDP_SHA}
+          git -C ironrdp checkout FETCH_HEAD
           echo "IronRDP pinned at ${IRONRDP_SHA}"
 
       - name: Apply uniTerm patches
