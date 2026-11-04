@@ -1,4 +1,4 @@
-From bc1cf07af92849a9c894dca88a2ed0b052337422 Mon Sep 17 00:00:00 2001
+From b8ecedac80d2f732ae7d1ff611c9ee1e4ac38cfb Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
 Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
@@ -34,11 +34,11 @@ broken TLS setup.
  crates/ironrdp-pdu/src/lib.rs                 |   2 +-
  crates/ironrdp-pdu/src/rdp/headers.rs         |  63 ++-
  crates/ironrdp-pdu/src/rdp/mod.rs             |   1 +
- .../ironrdp-pdu/src/rdp/security_exchange.rs  |  72 +++
+ .../ironrdp-pdu/src/rdp/security_exchange.rs  |  71 +++
  crates/ironrdp-session/src/active_stage.rs    |  37 +-
  crates/ironrdp-session/src/fast_path.rs       |  46 ++
  crates/ironrdp-session/src/x224/mod.rs        | 108 +++-
- crates/ironrdp-svc/src/lib.rs                 |  32 +-
+ crates/ironrdp-svc/src/lib.rs                 |  33 +-
  .../tests/rdpemsc/mod.rs                      |   1 +
  .../tests/session/active_stage.rs             |   1 +
  .../tests/session/autodetect.rs               |   1 +
@@ -1617,17 +1617,16 @@ index cc4b097a..eca1e0f8 100644
  pub mod server_redirection;
 diff --git a/crates/ironrdp-pdu/src/rdp/security_exchange.rs b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
 new file mode 100644
-index 00000000..d5e7f6bd
+index 00000000..76fb900a
 --- /dev/null
 +++ b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,71 @@
 +use ironrdp_core::{
 +    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
 +    ensure_size, invalid_field_err,
 +};
 +
 +use crate::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeader, BasicSecurityHeaderFlags};
-+use crate::PduResult;
 +
 +/// Maximum length of the RSA-encrypted client random (2048-bit modulus).
 +const MAX_ENCRYPTED_RANDOM_LEN: usize = 256;
@@ -2164,27 +2163,28 @@ index 8b7360c0..4e15ab8a 100644
  
  #[cfg(test)]
 diff --git a/crates/ironrdp-svc/src/lib.rs b/crates/ironrdp-svc/src/lib.rs
-index 7bab808e..86c86a09 100644
+index 7bab808e..e2603dd2 100644
 --- a/crates/ironrdp-svc/src/lib.rs
 +++ b/crates/ironrdp-svc/src/lib.rs
-@@ -206,6 +206,16 @@ fn encode_svc_messages(
+@@ -206,6 +206,17 @@ fn encode_svc_messages(
      initiator_id: u16,
      client: bool,
      max_chunk_len: usize,
 +) -> EncodeResult<Vec<u8>> {
-+    encode_svc_messages_secured(messages, channel_id, initiator_id, max_chunk_len, &mut |_| Ok(()))
++    encode_svc_messages_secured(messages, channel_id, initiator_id, client, max_chunk_len, &mut |_| Ok(()))
 +}
 +
 +fn encode_svc_messages_secured(
 +    messages: Vec<SvcMessage>,
 +    channel_id: u16,
 +    initiator_id: u16,
++    client: bool,
 +    max_chunk_len: usize,
 +    secure: &mut dyn FnMut(&mut [u8]) -> EncodeResult<()>,
  ) -> EncodeResult<Vec<u8>> {
      let mut fully_encoded_responses = WriteBuf::new(); // TODO(perf): reuse this buffer using `clear` and `filled` as appropriate
  
-@@ -221,11 +231,12 @@ fn encode_svc_messages(
+@@ -221,11 +232,12 @@ fn encode_svc_messages(
      // [ | tpkt | x224 | mcs::SendDataRequest | chunk 1 | tpkt | x224 | mcs::SendDataRequest | chunk 2 | ]
      //   |<------------------- PDU 1 ------------------>|<------------------- PDU 2 ------------------>|
      if client {
@@ -2199,7 +2199,7 @@ index 7bab808e..86c86a09 100644
              };
              encode_buf(&X224(pdu), &mut fully_encoded_responses)?;
          }
-@@ -267,6 +278,23 @@ pub fn client_encode_svc_messages_with_max_chunk_len(
+@@ -267,6 +279,23 @@ pub fn client_encode_svc_messages_with_max_chunk_len(
      encode_svc_messages(messages, channel_id, initiator_id, true, max_chunk_len)
  }
  
