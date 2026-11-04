@@ -1,4 +1,4 @@
-From e27fd81d4228a3038d45df2e890fee8e3cf82137 Mon Sep 17 00:00:00 2001
+From 03d0654d5da74ecd6a4d36bfce87e5f86927014c Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
 Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
@@ -23,10 +23,10 @@ broken TLS setup.
 ---
  crates/ironrdp-capture-replay/src/routing.rs  |   1 +
  crates/ironrdp-client/src/rdp.rs              |   4 +
- crates/ironrdp-connector/src/connection.rs    | 184 +++++-
- .../src/connection_activation.rs              |  72 ++-
- .../src/connection_finalization.rs            |  66 ++-
- crates/ironrdp-connector/src/lib.rs           |  47 +-
+ crates/ironrdp-connector/src/connection.rs    | 192 ++++++-
+ .../src/connection_activation.rs              |  73 ++-
+ .../src/connection_finalization.rs            |  67 ++-
+ crates/ironrdp-connector/src/lib.rs           |  41 +-
  .../ironrdp-connector/src/license_exchange.rs |  44 +-
  crates/ironrdp-pdu/src/crypto/mod.rs          |   1 +
  crates/ironrdp-pdu/src/crypto/rdp_security.rs | 526 ++++++++++++++++++
@@ -37,7 +37,7 @@ broken TLS setup.
  .../ironrdp-pdu/src/rdp/security_exchange.rs  |  71 +++
  crates/ironrdp-session/src/active_stage.rs    |  37 +-
  crates/ironrdp-session/src/fast_path.rs       |  46 ++
- crates/ironrdp-session/src/x224/mod.rs        | 108 +++-
+ crates/ironrdp-session/src/x224/mod.rs        | 109 +++-
  crates/ironrdp-svc/src/lib.rs                 |  33 +-
  .../tests/rdpemsc/mod.rs                      |   1 +
  .../tests/session/active_stage.rs             |   1 +
@@ -48,7 +48,7 @@ broken TLS setup.
  crates/ironrdp-testsuite-extra/tests/e2e.rs   |   7 +
  crates/ironrdp-web/src/session.rs             |   9 +-
  crates/ironrdp/examples/screenshot.rs         |   1 +
- 27 files changed, 1305 insertions(+), 63 deletions(-)
+ 27 files changed, 1314 insertions(+), 59 deletions(-)
  create mode 100644 crates/ironrdp-pdu/src/crypto/rdp_security.rs
  create mode 100644 crates/ironrdp-pdu/src/rdp/security_exchange.rs
 
@@ -101,7 +101,7 @@ index 6369efcf..ae83bc2e 100644
          .build();
  
 diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
-index b61f8b14..023dacb2 100644
+index b61f8b14..0828edfa 100644
 --- a/crates/ironrdp-connector/src/connection.rs
 +++ b/crates/ironrdp-connector/src/connection.rs
 @@ -2,10 +2,12 @@ use core::any::TypeId;
@@ -211,29 +211,34 @@ index b61f8b14..023dacb2 100644
              ClientConnectorState::SecureSettingsExchange { .. } => None,
              ClientConnectorState::ConnectTimeAutoDetection { .. } => {
                  // Wait for input only when a message channel was negotiated, so
-@@ -1503,8 +1542,20 @@ impl Sequence for ClientConnector {
-         };
- 
+@@ -1505,6 +1544,26 @@ impl Sequence for ClientConnector {
          if let Some(user_channel_id) = io_channel_phase_user_channel_id
--            && let Some(ctx) = self.message_channel_pdu(input)
-+            && let Some(mut ctx) = self.message_channel_pdu(input)
+             && let Some(ctx) = self.message_channel_pdu(input)
          {
 +            // Standard RDP Security: the message channel PDU body may be
 +            // session-encrypted behind an outer SEC_ENCRYPT header. Decrypt it
 +            // (the header stays in place for the decoders below).
-+            if let Some(security) = &self.security_ctx {
-+                let mut user_data = ctx.user_data.into_owned();
++            let decrypted;
++            let ctx = if let Some(security) = &self.security_ctx {
++                let mut user_data = ctx.user_data.to_vec();
 +                security
 +                    .lock()
 +                    .expect("security context mutex poisoned")
 +                    .decrypt_inbound(&mut user_data)
 +                    .map_err(ConnectorError::decode)?;
-+                ctx.user_data = Cow::Owned(user_data);
-+            }
++                decrypted = user_data;
++                mcs::SendDataIndicationCtx {
++                    initiator_id: ctx.initiator_id,
++                    channel_id: ctx.channel_id,
++                    user_data: &decrypted,
++                }
++            } else {
++                ctx
++            };
              return self.step_message_channel_pdu(ctx, received_at, user_channel_id, output);
          }
  
-@@ -1542,10 +1593,12 @@ impl Sequence for ClientConnector {
+@@ -1542,10 +1601,12 @@ impl Sequence for ClientConnector {
  
                  info!(?selected_protocol, ?flags, "Server confirmed connection");
  
@@ -249,7 +254,7 @@ index b61f8b14..023dacb2 100644
                  } else if self.entra_auth {
                      selected_protocol == nego::SecurityProtocol::RDSAAD
                  } else {
-@@ -1683,6 +1736,11 @@ impl Sequence for ClientConnector {
+@@ -1683,6 +1744,11 @@ impl Sequence for ClientConnector {
                      return Err(general_err!("can't satisfy server security settings"));
                  }
  
@@ -261,7 +266,7 @@ index b61f8b14..023dacb2 100644
                  self.message_channel_id = server_gcc_blocks
                      .message_channel
                      .as_ref()
-@@ -1742,9 +1800,21 @@ impl Sequence for ClientConnector {
+@@ -1742,9 +1808,21 @@ impl Sequence for ClientConnector {
                  {
                      debug_assert!(channel_connection.state.is_terminal());
  
@@ -286,7 +291,7 @@ index b61f8b14..023dacb2 100644
                      }
                  } else {
                      ClientConnectorState::ChannelConnection {
-@@ -1757,11 +1827,53 @@ impl Sequence for ClientConnector {
+@@ -1757,11 +1835,55 @@ impl Sequence for ClientConnector {
              }
  
              //== RDP Security Commencement ==//
@@ -312,17 +317,19 @@ index b61f8b14..023dacb2 100644
 +                let mut client_random = [0u8; 32];
 +                rand::RngCore::fill_bytes(&mut rand::rng(), &mut client_random);
 +
-+                let security = RdpSecurity::new(&client_random, server_security_data)?;
++                let security = RdpSecurity::new(&client_random, server_security_data)
++                    .map_err(|err| general_err!("standard RDP security").with_source(err))?;
 +
 +                // The client random is RSA-encrypted with the public key from the
 +                // server certificate delivered in the GCC ServerSecurityData.
-+                let mut cursor = ironrdp_core::ReadCursor::new(&server_security_data.server_cert);
 +                let server_certificate =
-+                    rdp::server_license::ServerCertificate::decode(&mut cursor).map_err(ConnectorError::decode)?;
++                    decode::<rdp::server_license::ServerCertificate>(&server_security_data.server_cert)
++                        .map_err(ConnectorError::decode)?;
 +                let public_key = server_certificate
 +                    .get_public_key()
-+                    .map_err(|err| general_err!("failed to extract the server public key: {err}"))?;
-+                let encrypted_client_random = encrypt_client_random(&client_random, &public_key)?;
++                    .map_err(|err| general_err!("server public key").with_source(err))?;
++                let encrypted_client_random = encrypt_client_random(&client_random, &public_key)
++                    .map_err(|err| general_err!("client random encryption").with_source(err))?;
 +
 +                let exchange_pdu = SecurityExchangePdu {
 +                    encrypted_client_random,
@@ -345,7 +352,7 @@ index b61f8b14..023dacb2 100644
  
              //== Secure Settings Exchange ==//
              // Send Client Info PDU (information about supported types of compression, username, password, etc).
-@@ -1782,7 +1894,20 @@ impl Sequence for ClientConnector {
+@@ -1782,7 +1904,20 @@ impl Sequence for ClientConnector {
  
                  debug!(message = ?client_info, "Send");
  
@@ -367,7 +374,7 @@ index b61f8b14..023dacb2 100644
  
                  (
                      Written::from_size(written)?,
-@@ -1814,6 +1939,7 @@ impl Sequence for ClientConnector {
+@@ -1814,6 +1949,7 @@ impl Sequence for ClientConnector {
                          .license_cache
                          .clone()
                          .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
@@ -375,7 +382,7 @@ index b61f8b14..023dacb2 100644
                  );
                  // If a PDU was read (message channel present) it is the first
                  // licensing PDU; advance the licensing sequence with it now,
-@@ -1945,8 +2071,12 @@ impl Sequence for ClientConnector {
+@@ -1945,8 +2081,12 @@ impl Sequence for ClientConnector {
                  } else if ctx.channel_id == io_channel_id {
                      // Demand Active: bootstrapping is over, hand off to capabilities
                      // exchange with the PDU intact.
@@ -390,7 +397,7 @@ index b61f8b14..023dacb2 100644
                      let written = connection_activation.step(input, received_at, output)?;
  
                      (
-@@ -2059,8 +2189,10 @@ impl Sequence for ClientConnector {
+@@ -2059,8 +2199,10 @@ impl Sequence for ClientConnector {
                                          connection_activation.io_channel_id(),
                                          connection_activation.user_channel_id(),
                                      )
@@ -401,7 +408,7 @@ index b61f8b14..023dacb2 100644
                                  },
                              }
                          }
-@@ -2090,7 +2222,17 @@ pub fn encode_send_data_request<T: Encode>(
+@@ -2090,7 +2232,17 @@ pub fn encode_send_data_request<T: Encode>(
      buf: &mut WriteBuf,
  ) -> ConnectorResult<usize> {
      let user_data = encode_vec(user_msg).map_err(ConnectorError::encode)?;
@@ -419,7 +426,7 @@ index b61f8b14..023dacb2 100644
      let pdu = mcs::SendDataRequest {
          initiator_id,
          channel_id,
-@@ -2219,7 +2361,15 @@ fn create_gcc_blocks<'a>(
+@@ -2219,7 +2371,15 @@ fn create_gcc_blocks<'a>(
              },
          },
          security: ClientSecurityData {
@@ -437,7 +444,7 @@ index b61f8b14..023dacb2 100644
          },
          network: if channels.is_empty() {
 diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
-index 04b8a710..123e44cc 100644
+index 04b8a710..aef139af 100644
 --- a/crates/ironrdp-connector/src/connection_activation.rs
 +++ b/crates/ironrdp-connector/src/connection_activation.rs
 @@ -9,9 +9,40 @@ use tracing::{debug, info, warn};
@@ -445,7 +452,7 @@ index 04b8a710..123e44cc 100644
  use crate::{
      Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
 -    MonotonicInstant, Sequence, State, Written, general_err, reason_err,
-+    MonotonicInstant, Sequence, SharedRdpSecurity, State, Written, decode_ctx_with_security, general_err, reason_err,
++    MonotonicInstant, Sequence, SharedRdpSecurity, State, Written, decode_and_decrypt, general_err, reason_err,
  };
  
 +/// Sends a Share Control PDU, sealing it with the Standard RDP Security
@@ -552,16 +559,18 @@ index 04b8a710..123e44cc 100644
      }
  }
  
-@@ -183,7 +240,7 @@ impl Sequence for ConnectionActivationSequence {
+@@ -182,8 +239,9 @@ impl Sequence for ConnectionActivationSequence {
+             ConnectionActivationState::CapabilitiesExchange => {
                  debug!("Capabilities Exchange");
  
++                let (initiator_id, channel_id, user_data) = decode_and_decrypt(input, &self.security, true)?;
                  let send_data_indication_ctx =
 -                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+                    decode_ctx_with_security(input, &self.security, true)?;
++                    ironrdp_pdu::mcs::SendDataIndicationCtx { initiator_id, channel_id, user_data: &user_data };
                  let share_control_ctx =
                      rdp::headers::decode_share_control(send_data_indication_ctx).map_err(ConnectorError::decode)?;
  
-@@ -342,14 +399,14 @@ impl Sequence for ConnectionActivationSequence {
+@@ -342,14 +400,14 @@ impl Sequence for ConnectionActivationSequence {
  
                  debug!(message = ?client_confirm_active, "Send");
  
@@ -579,7 +588,7 @@ index 04b8a710..123e44cc 100644
  
                  (
                      Written::from_size(written)?,
-@@ -361,10 +418,11 @@ impl Sequence for ConnectionActivationSequence {
+@@ -361,10 +419,11 @@ impl Sequence for ConnectionActivationSequence {
                          refresh_rect_support,
                          suppress_output_support,
                          window_support_level,
@@ -593,7 +602,7 @@ index 04b8a710..123e44cc 100644
                      },
                  )
 diff --git a/crates/ironrdp-connector/src/connection_finalization.rs b/crates/ironrdp-connector/src/connection_finalization.rs
-index 672a1494..6f4652b4 100644
+index 672a1494..d7d8b22e 100644
 --- a/crates/ironrdp-connector/src/connection_finalization.rs
 +++ b/crates/ironrdp-connector/src/connection_finalization.rs
 @@ -8,10 +8,45 @@ use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
@@ -603,7 +612,7 @@ index 672a1494..6f4652b4 100644
 -    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, general_err,
 -    reason_err,
 +    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, SharedRdpSecurity, State,
-+    Written, decode_ctx_with_security, general_err, reason_err,
++    Written, decode_and_decrypt, general_err, reason_err,
  };
  
 +fn encode_share_data_secured(
@@ -730,17 +739,18 @@ index 672a1494..6f4652b4 100644
                      output,
                  )
                  .map_err(ConnectorError::encode)?;
-@@ -189,7 +241,7 @@ impl Sequence for ConnectionFinalizationSequence {
+@@ -189,7 +241,8 @@ impl Sequence for ConnectionFinalizationSequence {
              }
  
              ConnectionFinalizationState::WaitForResponse => {
 -                let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+                let ctx = decode_ctx_with_security(input, &self.security, true)?;
++                let (initiator_id, channel_id, user_data) = decode_and_decrypt(input, &self.security, true)?;
++                let ctx = ironrdp_pdu::mcs::SendDataIndicationCtx { initiator_id, channel_id, user_data: &user_data };
                  let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ctx).map_err(ConnectorError::decode)?;
  
                  debug!(message = ?ctx.pdu, "Received");
 diff --git a/crates/ironrdp-connector/src/lib.rs b/crates/ironrdp-connector/src/lib.rs
-index 6fdc8c25..be639c92 100644
+index 6fdc8c25..95ae6d85 100644
 --- a/crates/ironrdp-connector/src/lib.rs
 +++ b/crates/ironrdp-connector/src/lib.rs
 @@ -23,6 +23,7 @@ mod server_name;
@@ -751,7 +761,7 @@ index 6fdc8c25..be639c92 100644
  use std::sync::Arc;
  
  use ironrdp_core::{Encode, WriteBuf, encode_buf, encode_vec};
-@@ -30,14 +31,56 @@ use ironrdp_pdu::nego::NegoRequestData;
+@@ -30,14 +31,50 @@ use ironrdp_pdu::nego::NegoRequestData;
  use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs};
  use ironrdp_pdu::rdp::client_info::{self, PerformanceFlags, TimezoneInfo};
  use ironrdp_pdu::x224::X224;
@@ -769,20 +779,22 @@ index 6fdc8c25..be639c92 100644
 +/// Decodes the Send Data Indication of an inbound PDU, decrypting the Standard
 +/// RDP Security envelope first when a security context is active.
 +///
-+/// When `strip` is set the outer `BasicSecurityHeader` (and the MAC, when the
-+/// `ENCRYPT` flag was present) is removed so the payload starts directly with
-+/// the Share Control header. Decoders that consume their own security header
-+/// (licensing, multitransport) pass `false`.
-+pub(crate) fn decode_ctx_with_security<'a>(
++/// Returns the MCS routing fields plus the payload as a copy-on-write buffer:
++/// borrowed straight from `input` when no security context is active, owned
++/// (decrypted) otherwise. When `strip` is set the outer `BasicSecurityHeader`
++/// (and the MAC, when the `ENCRYPT` flag was present) is removed so the payload
++/// starts directly with the Share Control header. Decoders that consume their
++/// own security header (licensing, multitransport) pass `false`.
++pub(crate) fn decode_and_decrypt<'a>(
 +    input: &'a [u8],
 +    security: &SharedRdpSecurity,
 +    strip: bool,
-+) -> ConnectorResult<mcs::SendDataIndicationCtx<'a>> {
++) -> ConnectorResult<(u16, u16, Cow<'a, [u8]>)> {
 +    let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 +    match security {
-+        None => Ok(ctx),
++        None => Ok((ctx.initiator_id, ctx.channel_id, Cow::Borrowed(ctx.user_data))),
 +        Some(ctx_security) => {
-+            let mut user_data = ctx.user_data.into_owned();
++            let mut user_data = ctx.user_data.to_vec();
 +            let (flags, body_offset) = ctx_security
 +                .lock()
 +                .expect("security context mutex poisoned")
@@ -790,19 +802,11 @@ index 6fdc8c25..be639c92 100644
 +                .map_err(ConnectorError::decode)?;
 +
 +            if strip && !flags.contains(ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags::REDIRECTION_PKT) {
-+                Ok(mcs::SendDataIndicationCtx {
-+                    initiator_id: ctx.initiator_id,
-+                    channel_id: ctx.channel_id,
-+                    user_data: Cow::Owned(user_data[body_offset..].to_vec()),
-+                })
++                Ok((ctx.initiator_id, ctx.channel_id, Cow::Owned(user_data[body_offset..].to_vec())))
 +            } else {
 +                // Keep the header in place: decoders like the Standard Security
 +                // Server Redirection PDU parse it themselves.
-+                Ok(mcs::SendDataIndicationCtx {
-+                    initiator_id: ctx.initiator_id,
-+                    channel_id: ctx.channel_id,
-+                    user_data: Cow::Owned(user_data),
-+                })
++                Ok((ctx.initiator_id, ctx.channel_id, Cow::Owned(user_data)))
 +            }
 +        }
 +    }
@@ -811,7 +815,7 @@ index 6fdc8c25..be639c92 100644
  pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
  pub use self::server_name::ServerName;
 diff --git a/crates/ironrdp-connector/src/license_exchange.rs b/crates/ironrdp-connector/src/license_exchange.rs
-index 23bda226..0eba498b 100644
+index 23bda226..3916223f 100644
 --- a/crates/ironrdp-connector/src/license_exchange.rs
 +++ b/crates/ironrdp-connector/src/license_exchange.rs
 @@ -2,17 +2,20 @@ use core::fmt::Debug;
@@ -855,69 +859,68 @@ index 23bda226..0eba498b 100644
      ) -> Self {
          Self {
              state: LicenseExchangeState::NewLicenseRequest,
-@@ -100,10 +108,35 @@ impl LicenseExchangeSequence {
+@@ -100,6 +108,31 @@ impl LicenseExchangeSequence {
              domain,
              hardware_id,
              license_cache,
 +            security,
++        }
++    }
++}
++
++
++/// Decodes the Send Data Indication of an inbound licensing PDU, decrypting
++/// the session-key envelope first when Standard RDP Security is active. The
++/// outer security header is left in place: the license PDU body carries its
++/// own `LicenseHeader` on top of it.
++fn decode_send_data<'a>(
++    security: &SharedRdpSecurity,
++    input: &'a [u8],
++) -> ConnectorResult<(u16, u16, Cow<'a, [u8]>)> {
++    let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++    match security {
++        None => Ok((ctx.initiator_id, ctx.channel_id, Cow::Borrowed(ctx.user_data))),
++        Some(security) => {
++            let mut user_data = ctx.user_data.to_vec();
++            security
++                .lock()
++                .expect("security context mutex poisoned")
++                .decrypt_inbound(&mut user_data)
++                .map_err(ConnectorError::decode)?;
++            Ok((ctx.initiator_id, ctx.channel_id, Cow::Owned(user_data)))
          }
      }
  }
- 
-+    /// Decodes the Send Data Indication of an inbound licensing PDU, decrypting
-+    /// the session-key envelope first when Standard RDP Security is active. The
-+    /// outer security header is left in place: the license PDU body carries its
-+    /// own `LicenseHeader` on top of it.
-+    fn decode_send_data<'a>(&self, input: &'a [u8]) -> ConnectorResult<mcs::SendDataIndicationCtx<'a>> {
-+        let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+        match &self.security {
-+            None => Ok(ctx),
-+            Some(security) => {
-+                let mut user_data = ctx.user_data.into_owned();
-+                security
-+                    .lock()
-+                    .expect("security context mutex poisoned")
-+                    .decrypt_inbound(&mut user_data)
-+                    .map_err(ConnectorError::decode)?;
-+                Ok(mcs::SendDataIndicationCtx {
-+                    initiator_id: ctx.initiator_id,
-+                    channel_id: ctx.channel_id,
-+                    user_data: Cow::Owned(user_data),
-+                })
-+            }
-+        }
-+    }
-+
- impl Sequence for LicenseExchangeSequence {
-     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
-         match self.state {
-@@ -133,8 +166,7 @@ impl Sequence for LicenseExchangeSequence {
+@@ -133,8 +166,9 @@ impl Sequence for LicenseExchangeSequence {
              }
  
              LicenseExchangeState::NewLicenseRequest => {
--                let send_data_indication_ctx =
++                let (initiator_id, channel_id, user_data) = decode_send_data(&self.security, input)?;
+                 let send_data_indication_ctx =
 -                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+                let send_data_indication_ctx = self.decode_send_data(input)?;
++                    mcs::SendDataIndicationCtx { initiator_id, channel_id, user_data: &user_data };
                  let license_pdu = send_data_indication_ctx
                      .decode_user_data::<LicensePdu>()
                      .map_err(ConnectorError::decode)
-@@ -269,8 +301,7 @@ impl Sequence for LicenseExchangeSequence {
+@@ -269,8 +303,9 @@ impl Sequence for LicenseExchangeSequence {
              }
  
              LicenseExchangeState::PlatformChallenge { encryption_data } => {
--                let send_data_indication_ctx =
++                let (initiator_id, channel_id, user_data) = decode_send_data(&self.security, input)?;
+                 let send_data_indication_ctx =
 -                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+                let send_data_indication_ctx = self.decode_send_data(input)?;
++                    mcs::SendDataIndicationCtx { initiator_id, channel_id, user_data: &user_data };
  
                  let license_pdu = send_data_indication_ctx
                      .decode_user_data::<LicensePdu>()
-@@ -323,8 +354,7 @@ impl Sequence for LicenseExchangeSequence {
+@@ -323,8 +358,9 @@ impl Sequence for LicenseExchangeSequence {
              }
  
              LicenseExchangeState::UpgradeLicense { encryption_data } => {
--                let send_data_indication_ctx =
++                let (initiator_id, channel_id, user_data) = decode_send_data(&self.security, input)?;
+                 let send_data_indication_ctx =
 -                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-+                let send_data_indication_ctx = self.decode_send_data(input)?;
++                    mcs::SendDataIndicationCtx { initiator_id, channel_id, user_data: &user_data };
  
                  let license_pdu = send_data_indication_ctx
                      .decode_user_data::<LicensePdu>()
@@ -1971,7 +1974,7 @@ index b55bd8ec..6987132e 100644
          .build();
          processor
 diff --git a/crates/ironrdp-session/src/x224/mod.rs b/crates/ironrdp-session/src/x224/mod.rs
-index 8b7360c0..4e15ab8a 100644
+index 8b7360c0..35d639f3 100644
 --- a/crates/ironrdp-session/src/x224/mod.rs
 +++ b/crates/ironrdp-session/src/x224/mod.rs
 @@ -15,10 +15,11 @@ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
@@ -2046,7 +2049,7 @@ index 8b7360c0..4e15ab8a 100644
          )
      }
  
-@@ -263,6 +288,36 @@ impl Processor {
+@@ -263,6 +288,37 @@ impl Processor {
                  return Err(SessionError::decode(error));
              }
          };
@@ -2055,10 +2058,11 @@ index 8b7360c0..4e15ab8a 100644
 +        // parse their own headers) and for the standard-security Server
 +        // Redirection variant; everything else is stripped down to the plaintext
 +        // Share Control payload.
++        let decrypted_storage: Vec<u8>;
 +        let data_ctx: SendDataIndicationCtx<'_> = match &self.security {
 +            None => data_ctx,
 +            Some(security) => {
-+                let mut user_data = data_ctx.user_data.into_owned();
++                let mut user_data = data_ctx.user_data.to_vec();
 +                let (flags, body_offset) = security
 +                    .lock()
 +                    .expect("security context mutex poisoned")
@@ -2067,7 +2071,7 @@ index 8b7360c0..4e15ab8a 100644
 +
 +                let keep_header = self.message_channel_id == Some(data_ctx.channel_id)
 +                    || flags.contains(BasicSecurityHeaderFlags::REDIRECTION_PKT);
-+                let user_data = if keep_header {
++                decrypted_storage = if keep_header {
 +                    user_data
 +                } else {
 +                    user_data[body_offset..].to_vec()
@@ -2076,14 +2080,14 @@ index 8b7360c0..4e15ab8a 100644
 +                SendDataIndicationCtx {
 +                    initiator_id: data_ctx.initiator_id,
 +                    channel_id: data_ctx.channel_id,
-+                    user_data: std::borrow::Cow::Owned(user_data),
++                    user_data: &decrypted_storage,
 +                }
 +            }
 +        };
          let channel_id = data_ctx.channel_id;
  
          if channel_id == self.io_channel_id {
-@@ -282,6 +337,7 @@ impl Processor {
+@@ -282,6 +338,7 @@ impl Processor {
                      data_ctx.initiator_id,
                      maximum_chunk_size,
                      Some(&*svc),
@@ -2091,7 +2095,7 @@ index 8b7360c0..4e15ab8a 100644
                  )
                  .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
              } else {
-@@ -613,14 +669,25 @@ impl Processor {
+@@ -613,14 +670,25 @@ impl Processor {
  
      /// Send a pdu on the static global channel. Typically used to send input events
      pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
@@ -2125,7 +2129,7 @@ index 8b7360c0..4e15ab8a 100644
          Ok(written)
      }
  }
-@@ -647,6 +714,7 @@ fn process_svc_messages(
+@@ -647,6 +715,7 @@ fn process_svc_messages(
      initiator_id: u16,
      maximum_chunk_size: usize,
      channel: Option<&StaticVirtualChannel>,
@@ -2133,7 +2137,7 @@ index 8b7360c0..4e15ab8a 100644
  ) -> SessionResult<Vec<u8>> {
      let messages = if channel.is_some_and(|channel| channel.channel_options().contains(ChannelOptions::SHOW_PROTOCOL)) {
          messages
-@@ -656,8 +724,26 @@ fn process_svc_messages(
+@@ -656,8 +725,26 @@ fn process_svc_messages(
      } else {
          messages
      };
