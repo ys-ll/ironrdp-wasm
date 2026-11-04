@@ -1,4 +1,4 @@
-From f48bf459025ff5dc765822e44dc7d57cb9c3319b Mon Sep 17 00:00:00 2001
+From e763b2dd34bc9634cf3cc5e3f2728cd2652130db Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
 Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
@@ -931,7 +931,7 @@ index aa76b1e3..1d13becf 100644
  pub(crate) mod rsa;
 diff --git a/crates/ironrdp-pdu/src/crypto/rdp_security.rs b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
 new file mode 100644
-index 00000000..21b8f007
+index 00000000..5c5858c9
 --- /dev/null
 +++ b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
 @@ -0,0 +1,525 @@
@@ -1334,7 +1334,7 @@ index 00000000..21b8f007
 +        .map_err(|err| crate::pdu_other_err!("parse server public key", source: err))?;
 +    let sequence = der_object
 +        .as_sequence()
-+        .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server public key DER is not a sequence"))?;
++        .map_err(|err| crate::pdu_other_err!("parse server public key", source: err))?;
 +    let modulus = sequence
 +        .first()
 +        .and_then(|object| object.as_slice())
