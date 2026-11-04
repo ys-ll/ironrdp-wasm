@@ -1,7 +1,7 @@
-From 28d9a4c28223d7cff6b377a522e72620c225d25e Mon Sep 17 00:00:00 2001
+From f48bf459025ff5dc765822e44dc7d57cb9c3319b Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
-Subject: rdp: implement standard RDP security (RC4) client support
+Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
 
 Implement the legacy pre-TLS RC4 encryption layer (PROTOCOL_RDP) so the
 client can connect to servers that only offer standard RDP security,
@@ -29,12 +29,12 @@ broken TLS setup.
  crates/ironrdp-connector/src/lib.rs           |  47 +-
  .../ironrdp-connector/src/license_exchange.rs |  44 +-
  crates/ironrdp-pdu/src/crypto/mod.rs          |   1 +
- crates/ironrdp-pdu/src/crypto/rdp_security.rs | 527 ++++++++++++++++++
+ crates/ironrdp-pdu/src/crypto/rdp_security.rs | 525 ++++++++++++++++++
  crates/ironrdp-pdu/src/input/fast_path.rs     |  38 ++
  crates/ironrdp-pdu/src/lib.rs                 |   2 +-
  crates/ironrdp-pdu/src/rdp/headers.rs         |  63 ++-
  crates/ironrdp-pdu/src/rdp/mod.rs             |   1 +
- .../ironrdp-pdu/src/rdp/security_exchange.rs  |  77 +++
+ .../ironrdp-pdu/src/rdp/security_exchange.rs  |  72 +++
  crates/ironrdp-session/src/active_stage.rs    |  37 +-
  crates/ironrdp-session/src/fast_path.rs       |  46 ++
  crates/ironrdp-session/src/x224/mod.rs        | 108 +++-
@@ -48,7 +48,7 @@ broken TLS setup.
  crates/ironrdp-testsuite-extra/tests/e2e.rs   |   7 +
  crates/ironrdp-web/src/session.rs             |   9 +-
  crates/ironrdp/examples/screenshot.rs         |   1 +
- 27 files changed, 1311 insertions(+), 63 deletions(-)
+ 27 files changed, 1304 insertions(+), 63 deletions(-)
  create mode 100644 crates/ironrdp-pdu/src/crypto/rdp_security.rs
  create mode 100644 crates/ironrdp-pdu/src/rdp/security_exchange.rs
 
@@ -931,10 +931,10 @@ index aa76b1e3..1d13becf 100644
  pub(crate) mod rsa;
 diff --git a/crates/ironrdp-pdu/src/crypto/rdp_security.rs b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
 new file mode 100644
-index 00000000..2e541ee4
+index 00000000..21b8f007
 --- /dev/null
 +++ b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,525 @@
 +//! Standard RDP Security (PROTOCOL_RDP) key derivation and packet protection.
 +//!
 +//! Implements [MS-RDPBCGR] 5.3 (the pre-TLS RC4-based encryption suite) on top of
@@ -943,8 +943,6 @@ index 00000000..2e541ee4
 +//! specification's pseudocode.
 +//!
 +//! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
-+
-+use ironrdp_core::other_err;
 +
 +use crate::crypto::rc4::Rc4;
 +use crate::crypto::rsa::encrypt_with_public_key;
@@ -1016,7 +1014,7 @@ index 00000000..2e541ee4
 +        } else if method.contains(EncryptionMethod::BIT_40) {
 +            Ok(Some(Self::Bit40))
 +        } else if method.contains(EncryptionMethod::FIPS) {
-+            Err(other_err!("rdp-security", "server selected FIPS encryption, which is not supported"))
++            Err(crate::pdu_other_err!("rdp-security", "server selected FIPS encryption, which is not supported"))
 +        } else {
 +            Ok(None)
 +        }
@@ -1197,14 +1195,14 @@ index 00000000..2e541ee4
 +    /// random must then be sent in the Security Exchange PDU.
 +    pub fn new(client_random: &[u8; CLIENT_RANDOM_LEN], server_data: &ServerSecurityData) -> PduResult<Self> {
 +        let Some(server_random) = server_data.server_random else {
-+            return Err(other_err!("rdp-security", "server security data has no server random"));
++            return Err(crate::pdu_other_err!("rdp-security", "server security data has no server random"));
 +        };
 +
 +        let method = RdpSecurityMethod::from_encryption_method(server_data.encryption_method)?
-+            .ok_or_else(|| other_err!("rdp-security", "server selected no encryption method"))?;
++            .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server selected no encryption method"))?;
 +
 +        if server_data.encryption_level == EncryptionLevel::None {
-+            return Err(other_err!(
++            return Err(crate::pdu_other_err!(
 +                "rdp-security",
 +                "server selected an encryption method with ENCRYPTION_LEVEL_NONE"
 +            ));
@@ -1264,7 +1262,7 @@ index 00000000..2e541ee4
 +        };
 +
 +        let mut out = Vec::with_capacity(BasicSecurityHeader::FIXED_PART_SIZE + MAC_SIZE + ciphertext.len());
-+        out.extend_from_slice(&encode_vec(&header).map_err(|err| other_err!("encode security header", source: err))?);
++        out.extend_from_slice(&encode_vec(&header).map_err(|err| crate::pdu_other_err!("encode security header", source: err))?);
 +        out.extend_from_slice(&mac);
 +        out.extend_from_slice(&ciphertext);
 +        Ok(out)
@@ -1285,7 +1283,7 @@ index 00000000..2e541ee4
 +
 +        let mut cursor = ironrdp_core::ReadCursor::new(payload);
 +        let header = BasicSecurityHeader::decode(&mut cursor)
-+            .map_err(|err| other_err!("decode security header", source: err))?;
++            .map_err(|err| crate::pdu_other_err!("decode security header", source: err))?;
 +        let body_offset = BasicSecurityHeader::FIXED_PART_SIZE;
 +
 +        if !header.flags.contains(BasicSecurityHeaderFlags::ENCRYPT) {
@@ -1294,14 +1292,14 @@ index 00000000..2e541ee4
 +
 +        let rest = &mut payload[body_offset..];
 +        if rest.len() < MAC_SIZE {
-+            return Err(other_err!("rdp-security", "encrypted payload is shorter than the MAC size"));
++            return Err(crate::pdu_other_err!("rdp-security", "encrypted payload is shorter than the MAC size"));
 +        }
 +        let (mac, ciphertext) = rest.split_at_mut(MAC_SIZE);
 +        // The MAC covers the plaintext; decrypt first, then verify.
 +        self.client_decrypt.apply(ciphertext);
 +        let expected = mac_digest(&self.mac_salt_key, ciphertext);
 +        if mac != expected.as_slice() {
-+            return Err(other_err!("rdp-security", "packet MAC verification failed"));
++            return Err(crate::pdu_other_err!("rdp-security", "packet MAC verification failed"));
 +        }
 +
 +        Ok((header.flags, body_offset + MAC_SIZE))
@@ -1317,7 +1315,7 @@ index 00000000..2e541ee4
 +pub fn encrypt_client_random(client_random: &[u8; CLIENT_RANDOM_LEN], public_key_der: &[u8]) -> PduResult<Vec<u8>> {
 +    let modulus_len = rsa_modulus_len(public_key_der)?;
 +    let mut encrypted = encrypt_with_public_key(client_random, public_key_der)
-+        .map_err(|err| other_err!("encrypt client random", source: err))?;
++        .map_err(|err| crate::pdu_other_err!("encrypt client random", source: err))?;
 +
 +    // Normalize to exactly one modulus worth of bytes: `encrypt_with_public_key`
 +    // returns the minimal big-endian-trimmed little-endian integer plus padding.
@@ -1333,14 +1331,14 @@ index 00000000..2e541ee4
 +    use der_parser::parse_der;
 +
 +    let (_, der_object) = parse_der(public_key_der)
-+        .map_err(|err| other_err!("parse server public key", source: err))?;
++        .map_err(|err| crate::pdu_other_err!("parse server public key", source: err))?;
 +    let sequence = der_object
 +        .as_sequence()
-+        .ok_or_else(|| other_err!("rdp-security", "server public key DER is not a sequence"))?;
++        .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server public key DER is not a sequence"))?;
 +    let modulus = sequence
 +        .first()
 +        .and_then(|object| object.as_slice())
-+        .ok_or_else(|| other_err!("rdp-security", "server public key has no modulus"))?;
++        .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server public key has no modulus"))?;
 +    Ok(modulus.len())
 +}
 +
@@ -1618,16 +1616,16 @@ index cc4b097a..eca1e0f8 100644
  pub mod server_redirection;
 diff --git a/crates/ironrdp-pdu/src/rdp/security_exchange.rs b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
 new file mode 100644
-index 00000000..5860562c
+index 00000000..d5e7f6bd
 --- /dev/null
 +++ b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,72 @@
 +use ironrdp_core::{
-+    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, decode, ensure_fixed_part_size,
++    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
 +    ensure_size, invalid_field_err,
 +};
 +
-+use crate::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
++use crate::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeader, BasicSecurityHeaderFlags};
 +use crate::PduResult;
 +
 +/// Maximum length of the RSA-encrypted client random (2048-bit modulus).
@@ -1645,6 +1643,8 @@ index 00000000..5860562c
 +
 +impl SecurityExchangePdu {
 +    const NAME: &'static str = "SecurityExchangePdu";
++
++    const FIXED_PART_SIZE: usize = BASIC_SECURITY_HEADER_SIZE + 4;
 +}
 +
 +impl Encode for SecurityExchangePdu {
@@ -1691,13 +1691,6 @@ index 00000000..5860562c
 +            encrypted_client_random,
 +        })
 +    }
-+}
-+
-+/// Helper mirroring the licensing-style decode: many call sites hold the payload
-+/// after the MCS Send Data Indication unwrap, where the security header prefix
-+/// must be inspected first. Returns the PDU after validating the header.
-+pub fn decode_security_exchange(payload: &[u8]) -> PduResult<SecurityExchangePdu> {
-+    decode::<SecurityExchangePdu>(&mut ReadCursor::new(payload))
 +}
 diff --git a/crates/ironrdp-session/src/active_stage.rs b/crates/ironrdp-session/src/active_stage.rs
 index afed7053..5656bf95 100644
