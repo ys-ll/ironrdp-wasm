@@ -1,4 +1,4 @@
-From e763b2dd34bc9634cf3cc5e3f2728cd2652130db Mon Sep 17 00:00:00 2001
+From bc1cf07af92849a9c894dca88a2ed0b052337422 Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
 Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
@@ -29,7 +29,7 @@ broken TLS setup.
  crates/ironrdp-connector/src/lib.rs           |  47 +-
  .../ironrdp-connector/src/license_exchange.rs |  44 +-
  crates/ironrdp-pdu/src/crypto/mod.rs          |   1 +
- crates/ironrdp-pdu/src/crypto/rdp_security.rs | 525 ++++++++++++++++++
+ crates/ironrdp-pdu/src/crypto/rdp_security.rs | 526 ++++++++++++++++++
  crates/ironrdp-pdu/src/input/fast_path.rs     |  38 ++
  crates/ironrdp-pdu/src/lib.rs                 |   2 +-
  crates/ironrdp-pdu/src/rdp/headers.rs         |  63 ++-
@@ -48,7 +48,7 @@ broken TLS setup.
  crates/ironrdp-testsuite-extra/tests/e2e.rs   |   7 +
  crates/ironrdp-web/src/session.rs             |   9 +-
  crates/ironrdp/examples/screenshot.rs         |   1 +
- 27 files changed, 1304 insertions(+), 63 deletions(-)
+ 27 files changed, 1305 insertions(+), 63 deletions(-)
  create mode 100644 crates/ironrdp-pdu/src/crypto/rdp_security.rs
  create mode 100644 crates/ironrdp-pdu/src/rdp/security_exchange.rs
 
@@ -931,10 +931,10 @@ index aa76b1e3..1d13becf 100644
  pub(crate) mod rsa;
 diff --git a/crates/ironrdp-pdu/src/crypto/rdp_security.rs b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
 new file mode 100644
-index 00000000..5c5858c9
+index 00000000..76fae7ab
 --- /dev/null
 +++ b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,526 @@
 +//! Standard RDP Security (PROTOCOL_RDP) key derivation and packet protection.
 +//!
 +//! Implements [MS-RDPBCGR] 5.3 (the pre-TLS RC4-based encryption suite) on top of
@@ -1337,8 +1337,9 @@ index 00000000..5c5858c9
 +        .map_err(|err| crate::pdu_other_err!("parse server public key", source: err))?;
 +    let modulus = sequence
 +        .first()
-+        .and_then(|object| object.as_slice())
-+        .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server public key has no modulus"))?;
++        .ok_or_else(|| crate::pdu_other_err!("rdp-security", "server public key has no modulus"))?
++        .as_slice()
++        .map_err(|err| crate::pdu_other_err!("parse server public key", source: err))?;
 +    Ok(modulus.len())
 +}
 +
