@@ -1,4 +1,4 @@
-From b8ecedac80d2f732ae7d1ff611c9ee1e4ac38cfb Mon Sep 17 00:00:00 2001
+From e27fd81d4228a3038d45df2e890fee8e3cf82137 Mon Sep 17 00:00:00 2001
 From: ys-ll <114486081+ys-ll@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:45:07 +0800
 Subject: [PATCH] rdp: implement standard RDP security (RC4) client support
@@ -2163,7 +2163,7 @@ index 8b7360c0..4e15ab8a 100644
  
  #[cfg(test)]
 diff --git a/crates/ironrdp-svc/src/lib.rs b/crates/ironrdp-svc/src/lib.rs
-index 7bab808e..e2603dd2 100644
+index 7bab808e..e487f143 100644
 --- a/crates/ironrdp-svc/src/lib.rs
 +++ b/crates/ironrdp-svc/src/lib.rs
 @@ -206,6 +206,17 @@ fn encode_svc_messages(
@@ -2217,7 +2217,7 @@ index 7bab808e..e2603dd2 100644
 +    max_chunk_len: usize,
 +    secure: &mut dyn FnMut(&mut [u8]) -> EncodeResult<()>,
 +) -> EncodeResult<Vec<u8>> {
-+    encode_svc_messages_secured(messages, channel_id, initiator_id, max_chunk_len, secure)
++    encode_svc_messages_secured(messages, channel_id, initiator_id, true, max_chunk_len, secure)
 +}
 +
  /// Encode a vector of [`SvcMessage`] in preparation for sending them on the `channel_id` channel.
