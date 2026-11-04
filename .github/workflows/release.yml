@@ -18,6 +18,9 @@ permissions:
 
 env:
   IRONRDP_REPO: https://github.com/Devolutions/IronRDP
+  # Pinned so the patches below always apply: bump this together with the
+  # patches when rebasing onto a new upstream master.
+  IRONRDP_SHA: 0ffe44f2576ffeb4cc299f116b0c1c6becc363c5
 
 jobs:
   build:
@@ -33,11 +36,10 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
 
-      - name: Checkout IronRDP (master HEAD, SHA recorded in release)
+      - name: Checkout IronRDP (pinned commit)
         run: |
-          git clone --depth 1 ${IRONRDP_REPO} ironrdp
-          IRONRDP_SHA=$(git -C ironrdp rev-parse HEAD)
-          echo "IRONRDP_SHA=${IRONRDP_SHA}" >> "$GITHUB_ENV"
+          git clone --no-checkout ${IRONRDP_REPO} ironrdp
+          git -C ironrdp checkout ${IRONRDP_SHA}
           echo "IronRDP pinned at ${IRONRDP_SHA}"
 
       - name: Apply uniTerm patches

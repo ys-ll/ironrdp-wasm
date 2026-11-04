@@ -1,0 +1,2413 @@
+From 28d9a4c28223d7cff6b377a522e72620c225d25e Mon Sep 17 00:00:00 2001
+From: ys-ll <114486081+ys-ll@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 15:45:07 +0800
+Subject: rdp: implement standard RDP security (RC4) client support
+
+Implement the legacy pre-TLS RC4 encryption layer (PROTOCOL_RDP) so the
+client can connect to servers that only offer standard RDP security,
+such as xrdp configured with security_layer=rdp or servers with a
+broken TLS setup.
+
+- pdu: add the standard RDP security crypto module (session key
+  derivation, MAC, RC4 streams with 4096-packet key rollover, 40/56/128
+  bit keys; FIPS rejected), the Security Exchange PDU, and secured
+  share-data encoders
+- connector: accept a PROTOCOL_RDP selection, advertise RC4 encryption
+  methods in GCC, add the Security Exchange phase, seal the Client Info
+  PDU, decrypt inbound envelopes, and thread the security context
+  through activation/finalization and the connection result
+- session: decrypt slow-path and fast-path inbound payloads, seal
+  outbound share data, static channel chunks and fast-path input
+- web: accept standard RDP security as an additional fallback while
+  still advertising SSL/HYBRID
+---
+ crates/ironrdp-capture-replay/src/routing.rs  |   1 +
+ crates/ironrdp-client/src/rdp.rs              |   4 +
+ crates/ironrdp-connector/src/connection.rs    | 184 +++++-
+ .../src/connection_activation.rs              |  72 ++-
+ .../src/connection_finalization.rs            |  66 ++-
+ crates/ironrdp-connector/src/lib.rs           |  47 +-
+ .../ironrdp-connector/src/license_exchange.rs |  44 +-
+ crates/ironrdp-pdu/src/crypto/mod.rs          |   1 +
+ crates/ironrdp-pdu/src/crypto/rdp_security.rs | 527 ++++++++++++++++++
+ crates/ironrdp-pdu/src/input/fast_path.rs     |  38 ++
+ crates/ironrdp-pdu/src/lib.rs                 |   2 +-
+ crates/ironrdp-pdu/src/rdp/headers.rs         |  63 ++-
+ crates/ironrdp-pdu/src/rdp/mod.rs             |   1 +
+ .../ironrdp-pdu/src/rdp/security_exchange.rs  |  77 +++
+ crates/ironrdp-session/src/active_stage.rs    |  37 +-
+ crates/ironrdp-session/src/fast_path.rs       |  46 ++
+ crates/ironrdp-session/src/x224/mod.rs        | 108 +++-
+ crates/ironrdp-svc/src/lib.rs                 |  32 +-
+ .../tests/rdpemsc/mod.rs                      |   1 +
+ .../tests/session/active_stage.rs             |   1 +
+ .../tests/session/autodetect.rs               |   1 +
+ .../tests/session/fastpath_input.rs           |   1 +
+ crates/ironrdp-testsuite-core/tests/svc.rs    |   2 +
+ .../tests/client/core_input.rs                |   1 +
+ crates/ironrdp-testsuite-extra/tests/e2e.rs   |   7 +
+ crates/ironrdp-web/src/session.rs             |   9 +-
+ crates/ironrdp/examples/screenshot.rs         |   1 +
+ 27 files changed, 1311 insertions(+), 63 deletions(-)
+ create mode 100644 crates/ironrdp-pdu/src/crypto/rdp_security.rs
+ create mode 100644 crates/ironrdp-pdu/src/rdp/security_exchange.rs
+
+diff --git a/crates/ironrdp-capture-replay/src/routing.rs b/crates/ironrdp-capture-replay/src/routing.rs
+index 678e1224..c4959682 100644
+--- a/crates/ironrdp-capture-replay/src/routing.rs
++++ b/crates/ironrdp-capture-replay/src/routing.rs
+@@ -230,6 +230,7 @@ impl ReplayRouter {
+             compression_type: activation.compression_type,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         Ok(Self {
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 6369efcf..ae83bc2e 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -4583,6 +4583,7 @@ async fn active_session(
+         compression_type: connection_result.compression_type,
+         enable_server_pointer: connection_result.enable_server_pointer,
+         pointer_software_rendering: connection_result.pointer_software_rendering,
++        security: None,
+     }
+     .build();
+     #[cfg(feature = "udp")]
+@@ -7825,6 +7826,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+ 
+@@ -7862,6 +7864,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+ 
+@@ -7899,6 +7902,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+ 
+diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
+index b61f8b14..023dacb2 100644
+--- a/crates/ironrdp-connector/src/connection.rs
++++ b/crates/ironrdp-connector/src/connection.rs
+@@ -2,10 +2,12 @@ use core::any::TypeId;
+ use core::mem;
+ use core::net::SocketAddr;
+ use std::borrow::Cow;
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ 
+ use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
++use ironrdp_pdu::crypto::rdp_security::{RdpSecurity, encrypt_client_random};
+ use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
++use ironrdp_pdu::rdp::security_exchange::SecurityExchangePdu;
+ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+ use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+ use ironrdp_pdu::x224::X224;
+@@ -187,6 +189,10 @@ pub struct ConnectionResult {
+     pub activation_factory: ConnectionActivationFactory,
+     /// The bulk compression type that was negotiated, if any.
+     pub compression_type: Option<rdp::client_info::CompressionType>,
++    /// Standard RDP Security state, present when the session runs over the
++    /// legacy RC4 encryption layer. Shared with the session layer, which must
++    /// keep (de)crypting every packet with the same RC4 streams.
++    pub security_ctx: SharedRdpSecurity,
+ }
+ 
+ impl ConnectionResult {
+@@ -262,6 +268,13 @@ pub enum ClientConnectorState {
+         io_channel_id: u16,
+         channel_connection: ChannelConnectionSequence,
+     },
++    /// RDP Security Commencement with encryption (Standard RDP Security at an
++    /// encryption level other than NONE): send the Security Exchange PDU
++    /// carrying the RSA-encrypted client random ([MS-RDPBCGR] 1.3.1.1, 5.3.2).
++    SecurityExchange {
++        io_channel_id: u16,
++        user_channel_id: u16,
++    },
+     SecureSettingsExchange {
+         io_channel_id: u16,
+         user_channel_id: u16,
+@@ -375,6 +388,7 @@ impl State for ClientConnectorState {
+             Self::BasicSettingsExchangeSendInitial { .. } => "BasicSettingsExchangeSendInitial",
+             Self::BasicSettingsExchangeWaitResponse { .. } => "BasicSettingsExchangeWaitResponse",
+             Self::ChannelConnection { .. } => "ChannelConnection",
++            Self::SecurityExchange { .. } => "SecurityExchange",
+             Self::SecureSettingsExchange { .. } => "SecureSettingsExchange",
+             Self::ConnectTimeAutoDetection { .. } => "ConnectTimeAutoDetection",
+             Self::LicensingExchange { .. } => "LicensingExchange",
+@@ -444,6 +458,15 @@ pub struct ClientConnector {
+     connect_time_bw_bytes: u32,
+     remote_guard: bool,
+     remote_guard_ready: bool,
++    /// The server's GCC `ServerSecurityData`, captured during the Basic Settings
++    /// Exchange. Populated whenever the server sent an SC_SECURITY block; for
++    /// Standard RDP Security it drives the Security Exchange and the session
++    /// keys.
++    server_security_data: Option<gcc::ServerSecurityData>,
++    /// Standard RDP Security state, created when the Security Exchange PDU is
++    /// sent. Shared with the connection activation sequence and the session
++    /// layer, which keep using the same RC4 streams for the whole connection.
++    security_ctx: SharedRdpSecurity,
+     // None disables NTLM; Some(None) binds it to the configured identity.
+     #[cfg(feature = "remote-guard")]
+     remote_guard_ntlm: Option<Option<sspi::rcg::NtlmRedirectionNames>>,
+@@ -452,6 +475,10 @@ pub struct ClientConnector {
+     remote_guard_kerberos: bool,
+ }
+ 
++/// The Standard RDP Security packet-protection state, shared between the
++/// connector, the connection activation sequence and the session.
++pub type SharedRdpSecurity = ironrdp_pdu::crypto::rdp_security::SharedRdpSecurity;
++
+ impl ClientConnector {
+     pub fn new(config: Config, client_addr: SocketAddr) -> Self {
+         Self {
+@@ -471,6 +498,8 @@ impl ClientConnector {
+             connect_time_bw_bytes: 0,
+             remote_guard: false,
+             remote_guard_ready: false,
++            server_security_data: None,
++            security_ctx: None,
+             #[cfg(feature = "remote-guard")]
+             remote_guard_ntlm: None,
+             #[cfg(feature = "remote-guard")]
+@@ -725,6 +754,15 @@ impl ClientConnector {
+         self.encode_connection_request(security_protocol, output)
+     }
+ 
++    /// Whether the server selected Standard RDP Security **with** encryption
++    /// (an encryption method other than NONE). Drives the Security Exchange
++    /// phase and the encrypted Secure Settings Exchange.
++    fn standard_security_encrypted(&self) -> bool {
++        self.server_security_data
++            .as_ref()
++            .is_some_and(|data| !data.encryption_method.is_empty())
++    }
++
+     fn enabled_security_protocols(&self) -> ConnectorResult<nego::SecurityProtocol> {
+         if self.remote_guard {
+             if !self.config.enable_credssp || self.entra_auth || self.auto_reconnect_cookie.is_some() {
+@@ -1449,6 +1487,7 @@ impl Sequence for ClientConnector {
+             }
+             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
+             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
++            ClientConnectorState::SecurityExchange { .. } => None,
+             ClientConnectorState::SecureSettingsExchange { .. } => None,
+             ClientConnectorState::ConnectTimeAutoDetection { .. } => {
+                 // Wait for input only when a message channel was negotiated, so
+@@ -1503,8 +1542,20 @@ impl Sequence for ClientConnector {
+         };
+ 
+         if let Some(user_channel_id) = io_channel_phase_user_channel_id
+-            && let Some(ctx) = self.message_channel_pdu(input)
++            && let Some(mut ctx) = self.message_channel_pdu(input)
+         {
++            // Standard RDP Security: the message channel PDU body may be
++            // session-encrypted behind an outer SEC_ENCRYPT header. Decrypt it
++            // (the header stays in place for the decoders below).
++            if let Some(security) = &self.security_ctx {
++                let mut user_data = ctx.user_data.into_owned();
++                security
++                    .lock()
++                    .expect("security context mutex poisoned")
++                    .decrypt_inbound(&mut user_data)
++                    .map_err(ConnectorError::decode)?;
++                ctx.user_data = Cow::Owned(user_data);
++            }
+             return self.step_message_channel_pdu(ctx, received_at, user_channel_id, output);
+         }
+ 
+@@ -1542,10 +1593,12 @@ impl Sequence for ClientConnector {
+ 
+                 info!(?selected_protocol, ?flags, "Server confirmed connection");
+ 
+-                // PROTOCOL_RDP is encoded as an empty bitset. `intersects` is false for two empty
+-                // sets, so treat standard RDP security as a special case.
++                // PROTOCOL_RDP is encoded as an empty bitset. The server may select it
++                // even when the client advertised enhanced protocols (the standard RDP
++                // security layer is always implicitly available), so accept it whenever
++                // the configuration opts in rather than comparing with the advertised set.
+                 let protocol_ok = if selected_protocol.is_standard_rdp_security() {
+-                    requested_protocol.is_standard_rdp_security()
++                    self.config.enable_standard_rdp_security
+                 } else if self.entra_auth {
+                     selected_protocol == nego::SecurityProtocol::RDSAAD
+                 } else {
+@@ -1683,6 +1736,11 @@ impl Sequence for ClientConnector {
+                     return Err(general_err!("can't satisfy server security settings"));
+                 }
+ 
++                // Retained for the Standard RDP Security commencement: the server
++                // random drives the session keys and the certificate carries the
++                // RSA key the client random is encrypted with.
++                self.server_security_data = Some(server_gcc_blocks.security.clone());
++
+                 self.message_channel_id = server_gcc_blocks
+                     .message_channel
+                     .as_ref()
+@@ -1742,9 +1800,21 @@ impl Sequence for ClientConnector {
+                 {
+                     debug_assert!(channel_connection.state.is_terminal());
+ 
+-                    ClientConnectorState::SecureSettingsExchange {
+-                        io_channel_id,
+-                        user_channel_id,
++                    // RDP Security Commencement: with Standard RDP Security at an
++                    // encryption level other than NONE, the client must send a
++                    // Security Exchange PDU before the Client Info PDU
++                    // ([MS-RDPBCGR] 5.3.2). At ENCRYPTION_LEVEL_NONE — and for
++                    // enhanced security transports — there is nothing to send.
++                    if self.standard_security_encrypted() {
++                        ClientConnectorState::SecurityExchange {
++                            io_channel_id,
++                            user_channel_id,
++                        }
++                    } else {
++                        ClientConnectorState::SecureSettingsExchange {
++                            io_channel_id,
++                            user_channel_id,
++                        }
+                     }
+                 } else {
+                     ClientConnectorState::ChannelConnection {
+@@ -1757,11 +1827,53 @@ impl Sequence for ClientConnector {
+             }
+ 
+             //== RDP Security Commencement ==//
+-            // With standard RDP security and ENCRYPTION_LEVEL_NONE, no Security Exchange PDU is
+-            // sent (MS-RDPBCGR 5.3.2). IronRDP only supports that no-encryption path; RC4/FIPS
+-            // would require a Security Exchange here and is rejected earlier when the server's
+-            // SC_SECURITY block is not ServerSecurityData::no_security().
+-            //==============================//
++            // Generate the client random, derive the session keys and send the
++            // Security Exchange PDU ([MS-RDPBCGR] 5.3.2, 5.3.3). The server does
++            // not answer; the next phase is the Secure Settings Exchange.
++            ClientConnectorState::SecurityExchange {
++                io_channel_id,
++                user_channel_id,
++            } => {
++                debug!("RDP Security Commencement (Security Exchange)");
++
++                let server_security_data = self
++                    .server_security_data
++                    .as_ref()
++                    .ok_or_else(|| general_err!("standard RDP security selected without server security data"))?;
++
++                let mut client_random = [0u8; 32];
++                rand::RngCore::fill_bytes(&mut rand::rng(), &mut client_random);
++
++                let security = RdpSecurity::new(&client_random, server_security_data)?;
++
++                // The client random is RSA-encrypted with the public key from the
++                // server certificate delivered in the GCC ServerSecurityData.
++                let mut cursor = ironrdp_core::ReadCursor::new(&server_security_data.server_cert);
++                let server_certificate =
++                    rdp::server_license::ServerCertificate::decode(&mut cursor).map_err(ConnectorError::decode)?;
++                let public_key = server_certificate
++                    .get_public_key()
++                    .map_err(|err| general_err!("failed to extract the server public key: {err}"))?;
++                let encrypted_client_random = encrypt_client_random(&client_random, &public_key)?;
++
++                let exchange_pdu = SecurityExchangePdu {
++                    encrypted_client_random,
++                };
++
++                debug!(message = ?exchange_pdu, "Send");
++
++                let written = encode_send_data_request(user_channel_id, io_channel_id, &exchange_pdu, output)?;
++
++                self.security_ctx = Some(Arc::new(Mutex::new(security)));
++
++                (
++                    Written::from_size(written)?,
++                    ClientConnectorState::SecureSettingsExchange {
++                        io_channel_id,
++                        user_channel_id,
++                    },
++                )
++            }
+ 
+             //== Secure Settings Exchange ==//
+             // Send Client Info PDU (information about supported types of compression, username, password, etc).
+@@ -1782,7 +1894,20 @@ impl Sequence for ClientConnector {
+ 
+                 debug!(message = ?client_info, "Send");
+ 
+-                let written = encode_send_data_request(user_channel_id, io_channel_id, &client_info, output)?;
++                // With Standard RDP Security the Client Info PDU travels inside
++                // the session-key envelope: security header + MAC + ciphertext
++                // ([MS-RDPBCGR] 5.3.3).
++                let written = if let Some(security) = &self.security_ctx {
++                    let client_info = encode_vec(&client_info).map_err(ConnectorError::encode)?;
++                    let payload = security
++                        .lock()
++                        .expect("security context mutex poisoned")
++                        .encrypt_outbound(&client_info, rdp::headers::BasicSecurityHeaderFlags::INFO_PKT)
++                        .map_err(ConnectorError::encode)?;
++                    encode_send_data_request_bytes(user_channel_id, io_channel_id, payload, output)?
++                } else {
++                    encode_send_data_request(user_channel_id, io_channel_id, &client_info, output)?
++                };
+ 
+                 (
+                     Written::from_size(written)?,
+@@ -1814,6 +1939,7 @@ impl Sequence for ClientConnector {
+                         .license_cache
+                         .clone()
+                         .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
++                    self.security_ctx.clone(),
+                 );
+                 // If a PDU was read (message channel present) it is the first
+                 // licensing PDU; advance the licensing sequence with it now,
+@@ -1945,8 +2071,12 @@ impl Sequence for ClientConnector {
+                 } else if ctx.channel_id == io_channel_id {
+                     // Demand Active: bootstrapping is over, hand off to capabilities
+                     // exchange with the PDU intact.
+-                    let mut connection_activation =
+-                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id);
++                    let mut connection_activation = ConnectionActivationSequence::new(
++                        self.config.clone(),
++                        io_channel_id,
++                        user_channel_id,
++                    )
++                    .with_security_ctx(self.security_ctx.clone());
+                     let written = connection_activation.step(input, received_at, output)?;
+ 
+                     (
+@@ -2059,8 +2189,10 @@ impl Sequence for ClientConnector {
+                                         connection_activation.io_channel_id(),
+                                         connection_activation.user_channel_id(),
+                                     )
++                                    .with_security_ctx(self.security_ctx.clone())
+                                     .with_multitransport_soft_sync(self.soft_sync_negotiated()),
+                                     compression_type: self.config.compression_type,
++                                    security_ctx: self.security_ctx.clone(),
+                                 },
+                             }
+                         }
+@@ -2090,7 +2222,17 @@ pub fn encode_send_data_request<T: Encode>(
+     buf: &mut WriteBuf,
+ ) -> ConnectorResult<usize> {
+     let user_data = encode_vec(user_msg).map_err(ConnectorError::encode)?;
++    encode_send_data_request_bytes(initiator_id, channel_id, user_data, buf)
++}
+ 
++/// Same as [`encode_send_data_request`], but the MCS user data is provided
++/// pre-encoded (used by the Standard RDP Security envelope paths).
++pub fn encode_send_data_request_bytes(
++    initiator_id: u16,
++    channel_id: u16,
++    user_data: Vec<u8>,
++    buf: &mut WriteBuf,
++) -> ConnectorResult<usize> {
+     let pdu = mcs::SendDataRequest {
+         initiator_id,
+         channel_id,
+@@ -2219,7 +2361,15 @@ fn create_gcc_blocks<'a>(
+             },
+         },
+         security: ClientSecurityData {
+-            encryption_methods: EncryptionMethod::empty(),
++            // With Standard RDP Security the client advertises the RC4 encryption
++            // methods it can do ([MS-RDPBCGR] 2.2.1.4.3); the server picks one in
++            // its ServerSecurityData. Enhanced security transports keep the block
++            // empty (no RDP-level encryption below TLS/CredSSP).
++            encryption_methods: if selected_protocol.is_standard_rdp_security() {
++                ironrdp_pdu::crypto::rdp_security::RdpSecurityMethod::advertised_methods()
++            } else {
++                EncryptionMethod::empty()
++            },
+             ext_encryption_methods: 0,
+         },
+         network: if channels.is_empty() {
+diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
+index 04b8a710..123e44cc 100644
+--- a/crates/ironrdp-connector/src/connection_activation.rs
++++ b/crates/ironrdp-connector/src/connection_activation.rs
+@@ -9,9 +9,40 @@ use tracing::{debug, info, warn};
+ 
+ use crate::{
+     Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
+-    MonotonicInstant, Sequence, State, Written, general_err, reason_err,
++    MonotonicInstant, Sequence, SharedRdpSecurity, State, Written, decode_ctx_with_security, general_err, reason_err,
+ };
+ 
++/// Sends a Share Control PDU, sealing it with the Standard RDP Security
++/// envelope when a security context is active.
++fn encode_share_control_secured(
++    initiator_id: u16,
++    channel_id: u16,
++    share_id: u32,
++    pdu: rdp::headers::ShareControlPdu,
++    security: &SharedRdpSecurity,
++    output: &mut ironrdp_core::WriteBuf,
++) -> ConnectorResult<usize> {
++    match security {
++        Some(ctx) => {
++            let written = rdp::headers::encode_share_control_secured(
++                initiator_id,
++                channel_id,
++                share_id,
++                pdu,
++                &mut ctx.lock().expect("security context mutex poisoned"),
++                output,
++            )
++            .map_err(ConnectorError::encode)?;
++            Ok(written)
++        }
++        None => {
++            let written = rdp::headers::encode_share_control(initiator_id, channel_id, share_id, pdu, output)
++                .map_err(ConnectorError::encode)?;
++            Ok(written)
++        }
++    }
++}
++
+ /// The largest desktop width or height accepted from the server's Bitmap capability set.
+ ///
+ /// The Bitmap capability itself leaves these fields unconstrained, so this reuses the virtual desktop limit of the
+@@ -43,10 +74,23 @@ pub struct ConnectionActivationSequence {
+     // here (rather than duplicated into every state variant).
+     io_channel_id: u16,
+     user_channel_id: u16,
++    /// Standard RDP Security state: the Demand Active and every finalization
++    /// PDU travel inside the session-key envelope when the session runs over
++    /// the legacy RC4 layer.
++    security: SharedRdpSecurity,
+ }
+ 
+ impl ConnectionActivationSequence {
+     pub fn new(config: Config, io_channel_id: u16, user_channel_id: u16) -> Self {
++        Self::with_security_ctx(config, io_channel_id, user_channel_id, None)
++    }
++
++    pub fn with_security_ctx(
++        config: Config,
++        io_channel_id: u16,
++        user_channel_id: u16,
++        security: SharedRdpSecurity,
++    ) -> Self {
+         // TODO/FIXME: Investigate whether we really need to carry around the whole `Config` struct.
+         // RATIONALE(@CBenoit): Not very convenient when building in isolation.
+         //   I doubt this type really needs every field there.
+@@ -56,6 +100,7 @@ impl ConnectionActivationSequence {
+             config,
+             io_channel_id,
+             user_channel_id,
++            security,
+         }
+     }
+ 
+@@ -93,6 +138,7 @@ pub struct ConnectionActivationFactory {
+     io_channel_id: u16,
+     user_channel_id: u16,
+     multitransport_soft_sync: bool,
++    security: SharedRdpSecurity,
+ }
+ 
+ impl ConnectionActivationFactory {
+@@ -102,9 +148,15 @@ impl ConnectionActivationFactory {
+             io_channel_id,
+             user_channel_id,
+             multitransport_soft_sync: false,
++            security: None,
+         }
+     }
+ 
++    pub(crate) fn with_security_ctx(mut self, security: SharedRdpSecurity) -> Self {
++        self.security = security;
++        self
++    }
++
+     pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
+         self.multitransport_soft_sync = multitransport_soft_sync;
+         self
+@@ -125,7 +177,12 @@ impl ConnectionActivationFactory {
+     /// Produces a fresh [`ConnectionActivationSequence`] in the initial `CapabilitiesExchange` state.
+     #[must_use]
+     pub fn create(&self) -> ConnectionActivationSequence {
+-        ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
++        ConnectionActivationSequence::with_security_ctx(
++            self.config.clone(),
++            self.io_channel_id,
++            self.user_channel_id,
++            self.security.clone(),
++        )
+     }
+ }
+ 
+@@ -183,7 +240,7 @@ impl Sequence for ConnectionActivationSequence {
+                 debug!("Capabilities Exchange");
+ 
+                 let send_data_indication_ctx =
+-                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++                    decode_ctx_with_security(input, &self.security, true)?;
+                 let share_control_ctx =
+                     rdp::headers::decode_share_control(send_data_indication_ctx).map_err(ConnectorError::decode)?;
+ 
+@@ -342,14 +399,14 @@ impl Sequence for ConnectionActivationSequence {
+ 
+                 debug!(message = ?client_confirm_active, "Send");
+ 
+-                let written = rdp::headers::encode_share_control(
++                let written = encode_share_control_secured(
+                     self.user_channel_id,
+                     self.io_channel_id,
+                     share_id,
+                     client_confirm_active,
++                    &self.security,
+                     output,
+-                )
+-                .map_err(ConnectorError::encode)?;
++                )?;
+ 
+                 (
+                     Written::from_size(written)?,
+@@ -361,10 +418,11 @@ impl Sequence for ConnectionActivationSequence {
+                         refresh_rect_support,
+                         suppress_output_support,
+                         window_support_level,
+-                        connection_finalization: ConnectionFinalizationSequence::new(
++                        connection_finalization: ConnectionFinalizationSequence::with_security_ctx(
+                             self.io_channel_id,
+                             self.user_channel_id,
+                             share_id,
++                            self.security.clone(),
+                         ),
+                     },
+                 )
+diff --git a/crates/ironrdp-connector/src/connection_finalization.rs b/crates/ironrdp-connector/src/connection_finalization.rs
+index 672a1494..6f4652b4 100644
+--- a/crates/ironrdp-connector/src/connection_finalization.rs
++++ b/crates/ironrdp-connector/src/connection_finalization.rs
+@@ -8,10 +8,45 @@ use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
+ use tracing::{debug, warn};
+ 
+ use crate::{
+-    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, general_err,
+-    reason_err,
++    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, SharedRdpSecurity, State,
++    Written, decode_ctx_with_security, general_err, reason_err,
+ };
+ 
++fn encode_share_data_secured(
++    initiator_id: u16,
++    channel_id: u16,
++    share_id: u32,
++    message: ShareDataPdu,
++    security: &mut SharedRdpSecurity,
++    output: &mut WriteBuf,
++) -> ConnectorResult<usize> {
++    match security {
++        Some(ctx) => {
++            let written = ironrdp_pdu::rdp::headers::encode_share_data_secured(
++                initiator_id,
++                channel_id,
++                share_id,
++                message,
++                &mut ctx.lock().expect("security context mutex poisoned"),
++                output,
++            )
++            .map_err(ConnectorError::encode)?;
++            Ok(written)
++        }
++        None => {
++            let written = ironrdp_pdu::rdp::headers::encode_share_data(
++                initiator_id,
++                channel_id,
++                share_id,
++                message,
++                output,
++            )
++            .map_err(ConnectorError::encode)?;
++            Ok(written)
++        }
++    }
++}
++
+ #[derive(Default, Debug, Copy, Clone)]
+ #[non_exhaustive]
+ pub enum ConnectionFinalizationState {
+@@ -57,16 +92,29 @@ pub struct ConnectionFinalizationSequence {
+     pub user_channel_id: u16,
+     pub share_id: u32,
+     pub monitor_layout: Option<finalization_messages::MonitorLayoutPdu>,
++    /// Standard RDP Security state: finalization PDUs travel inside the
++    /// session-key envelope when the session runs over the legacy RC4 layer.
++    security: SharedRdpSecurity,
+ }
+ 
+ impl ConnectionFinalizationSequence {
+     pub fn new(io_channel_id: u16, user_channel_id: u16, share_id: u32) -> Self {
++        Self::with_security_ctx(io_channel_id, user_channel_id, share_id, None)
++    }
++
++    pub fn with_security_ctx(
++        io_channel_id: u16,
++        user_channel_id: u16,
++        share_id: u32,
++        security: SharedRdpSecurity,
++    ) -> Self {
+         Self {
+             state: ConnectionFinalizationState::SendSynchronize,
+             io_channel_id,
+             user_channel_id,
+             share_id,
+             monitor_layout: None,
++            security,
+         }
+     }
+ }
+@@ -108,11 +156,12 @@ impl Sequence for ConnectionFinalizationSequence {
+ 
+                 debug!(?message, "Send");
+ 
+-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
++                let written = encode_share_data_secured(
+                     self.user_channel_id,
+                     self.io_channel_id,
+                     self.share_id,
+                     message,
++                    &mut self.security,
+                     output,
+                 )
+                 .map_err(ConnectorError::encode)?;
+@@ -132,11 +181,12 @@ impl Sequence for ConnectionFinalizationSequence {
+ 
+                 debug!(?message, "Send");
+ 
+-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
++                let written = encode_share_data_secured(
+                     self.user_channel_id,
+                     self.io_channel_id,
+                     self.share_id,
+                     message,
++                    &mut self.security,
+                     output,
+                 )
+                 .map_err(ConnectorError::encode)?;
+@@ -156,11 +206,12 @@ impl Sequence for ConnectionFinalizationSequence {
+ 
+                 debug!(?message, "Send");
+ 
+-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
++                let written = encode_share_data_secured(
+                     self.user_channel_id,
+                     self.io_channel_id,
+                     self.share_id,
+                     message,
++                    &mut self.security,
+                     output,
+                 )
+                 .map_err(ConnectorError::encode)?;
+@@ -173,11 +224,12 @@ impl Sequence for ConnectionFinalizationSequence {
+ 
+                 debug!(?message, "Send");
+ 
+-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
++                let written = encode_share_data_secured(
+                     self.user_channel_id,
+                     self.io_channel_id,
+                     self.share_id,
+                     message,
++                    &mut self.security,
+                     output,
+                 )
+                 .map_err(ConnectorError::encode)?;
+@@ -189,7 +241,7 @@ impl Sequence for ConnectionFinalizationSequence {
+             }
+ 
+             ConnectionFinalizationState::WaitForResponse => {
+-                let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++                let ctx = decode_ctx_with_security(input, &self.security, true)?;
+                 let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ctx).map_err(ConnectorError::decode)?;
+ 
+                 debug!(message = ?ctx.pdu, "Received");
+diff --git a/crates/ironrdp-connector/src/lib.rs b/crates/ironrdp-connector/src/lib.rs
+index 6fdc8c25..be639c92 100644
+--- a/crates/ironrdp-connector/src/lib.rs
++++ b/crates/ironrdp-connector/src/lib.rs
+@@ -23,6 +23,7 @@ mod server_name;
+ 
+ use core::any::Any;
+ use core::fmt;
++use std::borrow::Cow;
+ use std::sync::Arc;
+ 
+ use ironrdp_core::{Encode, WriteBuf, encode_buf, encode_vec};
+@@ -30,14 +31,56 @@ use ironrdp_pdu::nego::NegoRequestData;
+ use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs};
+ use ironrdp_pdu::rdp::client_info::{self, PerformanceFlags, TimezoneInfo};
+ use ironrdp_pdu::x224::X224;
+-use ironrdp_pdu::{PduHint, gcc, x224};
++use ironrdp_pdu::{PduHint, gcc, mcs, x224};
+ pub use sspi;
+ 
+ pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
+ pub use self::connection::{
+     ClientConnector, ClientConnectorState, ConnectionOutcome, ConnectionResult, DynamicStaticChannelAttachError,
+-    MultitransportResult, encode_send_data_request,
++    MultitransportResult, SharedRdpSecurity, encode_send_data_request,
+ };
++
++/// Decodes the Send Data Indication of an inbound PDU, decrypting the Standard
++/// RDP Security envelope first when a security context is active.
++///
++/// When `strip` is set the outer `BasicSecurityHeader` (and the MAC, when the
++/// `ENCRYPT` flag was present) is removed so the payload starts directly with
++/// the Share Control header. Decoders that consume their own security header
++/// (licensing, multitransport) pass `false`.
++pub(crate) fn decode_ctx_with_security<'a>(
++    input: &'a [u8],
++    security: &SharedRdpSecurity,
++    strip: bool,
++) -> ConnectorResult<mcs::SendDataIndicationCtx<'a>> {
++    let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++    match security {
++        None => Ok(ctx),
++        Some(ctx_security) => {
++            let mut user_data = ctx.user_data.into_owned();
++            let (flags, body_offset) = ctx_security
++                .lock()
++                .expect("security context mutex poisoned")
++                .decrypt_inbound(&mut user_data)
++                .map_err(ConnectorError::decode)?;
++
++            if strip && !flags.contains(ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags::REDIRECTION_PKT) {
++                Ok(mcs::SendDataIndicationCtx {
++                    initiator_id: ctx.initiator_id,
++                    channel_id: ctx.channel_id,
++                    user_data: Cow::Owned(user_data[body_offset..].to_vec()),
++                })
++            } else {
++                // Keep the header in place: decoders like the Standard Security
++                // Server Redirection PDU parse it themselves.
++                Ok(mcs::SendDataIndicationCtx {
++                    initiator_id: ctx.initiator_id,
++                    channel_id: ctx.channel_id,
++                    user_data: Cow::Owned(user_data),
++                })
++            }
++        }
++    }
++}
+ pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
+ pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
+ pub use self::server_name::ServerName;
+diff --git a/crates/ironrdp-connector/src/license_exchange.rs b/crates/ironrdp-connector/src/license_exchange.rs
+index 23bda226..0eba498b 100644
+--- a/crates/ironrdp-connector/src/license_exchange.rs
++++ b/crates/ironrdp-connector/src/license_exchange.rs
+@@ -2,17 +2,20 @@ use core::fmt::Debug;
+ use core::panic::RefUnwindSafe;
+ use core::{fmt, mem};
+ use std::str;
++use std::borrow::Cow;
+ use std::sync::Arc;
+ 
+ use ironrdp_core::WriteBuf;
+ use ironrdp_pdu::PduHint;
++use ironrdp_pdu::mcs;
+ use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerLicenseError};
+ use rand::RngCore as _;
+ use tracing::{debug, error, info, trace};
+ 
+ use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err};
+ use crate::{
+-    ConnectorResult, ConnectorResultExt as _, MonotonicInstant, Sequence, State, Written, encode_send_data_request,
++    ConnectorResult, ConnectorResultExt as _, MonotonicInstant, Sequence, State, SharedRdpSecurity, Written,
++    encode_send_data_request,
+ };
+ 
+ #[derive(Default, Debug)]
+@@ -64,6 +67,10 @@ pub struct LicenseExchangeSequence {
+     pub domain: Option<String>,
+     pub hardware_id: [u32; 4],
+     pub license_cache: Arc<dyn LicenseCache>,
++    /// Standard RDP Security state: licensing PDUs may arrive session-encrypted
++    /// (outer `SEC_ENCRYPT` security header) even though their body carries its
++    /// own license-key encryption.
++    security: SharedRdpSecurity,
+ }
+ 
+ // Use RefUnwindSafe so that types that embed LicenseCache remain UnwindSafe
+@@ -92,6 +99,7 @@ impl LicenseExchangeSequence {
+         domain: Option<String>,
+         hardware_id: [u32; 4],
+         license_cache: Arc<dyn LicenseCache>,
++        security: SharedRdpSecurity,
+     ) -> Self {
+         Self {
+             state: LicenseExchangeState::NewLicenseRequest,
+@@ -100,10 +108,35 @@ impl LicenseExchangeSequence {
+             domain,
+             hardware_id,
+             license_cache,
++            security,
+         }
+     }
+ }
+ 
++    /// Decodes the Send Data Indication of an inbound licensing PDU, decrypting
++    /// the session-key envelope first when Standard RDP Security is active. The
++    /// outer security header is left in place: the license PDU body carries its
++    /// own `LicenseHeader` on top of it.
++    fn decode_send_data<'a>(&self, input: &'a [u8]) -> ConnectorResult<mcs::SendDataIndicationCtx<'a>> {
++        let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++        match &self.security {
++            None => Ok(ctx),
++            Some(security) => {
++                let mut user_data = ctx.user_data.into_owned();
++                security
++                    .lock()
++                    .expect("security context mutex poisoned")
++                    .decrypt_inbound(&mut user_data)
++                    .map_err(ConnectorError::decode)?;
++                Ok(mcs::SendDataIndicationCtx {
++                    initiator_id: ctx.initiator_id,
++                    channel_id: ctx.channel_id,
++                    user_data: Cow::Owned(user_data),
++                })
++            }
++        }
++    }
++
+ impl Sequence for LicenseExchangeSequence {
+     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
+         match self.state {
+@@ -133,8 +166,7 @@ impl Sequence for LicenseExchangeSequence {
+             }
+ 
+             LicenseExchangeState::NewLicenseRequest => {
+-                let send_data_indication_ctx =
+-                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++                let send_data_indication_ctx = self.decode_send_data(input)?;
+                 let license_pdu = send_data_indication_ctx
+                     .decode_user_data::<LicensePdu>()
+                     .map_err(ConnectorError::decode)
+@@ -269,8 +301,7 @@ impl Sequence for LicenseExchangeSequence {
+             }
+ 
+             LicenseExchangeState::PlatformChallenge { encryption_data } => {
+-                let send_data_indication_ctx =
+-                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++                let send_data_indication_ctx = self.decode_send_data(input)?;
+ 
+                 let license_pdu = send_data_indication_ctx
+                     .decode_user_data::<LicensePdu>()
+@@ -323,8 +354,7 @@ impl Sequence for LicenseExchangeSequence {
+             }
+ 
+             LicenseExchangeState::UpgradeLicense { encryption_data } => {
+-                let send_data_indication_ctx =
+-                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
++                let send_data_indication_ctx = self.decode_send_data(input)?;
+ 
+                 let license_pdu = send_data_indication_ctx
+                     .decode_user_data::<LicensePdu>()
+diff --git a/crates/ironrdp-pdu/src/crypto/mod.rs b/crates/ironrdp-pdu/src/crypto/mod.rs
+index aa76b1e3..1d13becf 100644
+--- a/crates/ironrdp-pdu/src/crypto/mod.rs
++++ b/crates/ironrdp-pdu/src/crypto/mod.rs
+@@ -1,2 +1,3 @@
++pub mod rdp_security;
+ pub(crate) mod rc4;
+ pub(crate) mod rsa;
+diff --git a/crates/ironrdp-pdu/src/crypto/rdp_security.rs b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
+new file mode 100644
+index 00000000..2e541ee4
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/crypto/rdp_security.rs
+@@ -0,0 +1,527 @@
++//! Standard RDP Security (PROTOCOL_RDP) key derivation and packet protection.
++//!
++//! Implements [MS-RDPBCGR] 5.3 (the pre-TLS RC4-based encryption suite) on top of
++//! the RC4/RSA primitives from [`crate::crypto`]. Every constant and hash schedule
++//! mirrors FreeRDP's `libfreerdp/core/security.c`, which matches the
++//! specification's pseudocode.
++//!
++//! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
++
++use ironrdp_core::other_err;
++
++use crate::crypto::rc4::Rc4;
++use crate::crypto::rsa::encrypt_with_public_key;
++use crate::gcc::{EncryptionLevel, EncryptionMethod, ServerSecurityData};
++use crate::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
++use crate::{PduError, PduResult};
++
++const CLIENT_RANDOM_LEN: usize = 32;
++
++/// Master secret / session key blob length.
++const SECRET_LEN: usize = 48;
++const SALT_VALUE: [u8; 3] = [0xD1, 0x26, 0x9E];
++const PAD1: [u8; 40] = [0x36; 40];
++const PAD2: [u8; 48] = [0x5C; 48];
++
++/// MAC data sent on the wire is the first 8 bytes of the derived MD5 digest.
++pub const MAC_SIZE: usize = 8;
++
++/// RC4 keys are rolled over after this many encryption/decryption applications
++/// ([MS-RDPBCGR] 5.3.6; FreeRDP `security_encrypt`/`security_decrypt`).
++const KEY_UPDATE_INTERVAL: u32 = 4096;
++
++/// The Standard RDP Security packet-protection state, shared between the
++/// connector, the connection activation sequence and the session: a single
++/// instance owns the RC4 streams for the whole connection.
++pub type SharedRdpSecurity = Option<std::sync::Arc<std::sync::Mutex<RdpSecurity>>>;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RdpSecurityMethod {
++    Bit40,
++    Bit56,
++    Bit128,
++}
++
++impl RdpSecurityMethod {
++    /// Effective RC4 key length: 40- and 56-bit keys are salted into an
++    /// 8-byte RC4 key ([MS-RDPBCGR] 5.3.4).
++    fn rc4_key_len(self) -> usize {
++        match self {
++            Self::Bit40 | Self::Bit56 => 8,
++            Self::Bit128 => 16,
++        }
++    }
++
++    fn salt_len(self) -> usize {
++        match self {
++            Self::Bit40 => 3,
++            Self::Bit56 => 1,
++            Self::Bit128 => 0,
++        }
++    }
++
++    /// The client's advertised method set: everything this implementation can do.
++    pub const fn advertised_methods() -> EncryptionMethod {
++        EncryptionMethod::BIT_40
++            .union(EncryptionMethod::BIT_56)
++            .union(EncryptionMethod::BIT_128)
++    }
++
++    /// Maps the server's selected encryption method, rejecting everything this
++    /// implementation cannot satisfy (FIPS uses 3DES/DESX and is not supported).
++    pub fn from_encryption_method(method: EncryptionMethod) -> Result<Option<Self>, PduError> {
++        // The server selects a single bit from the client's advertisement, but the
++        // spec leaves room for multi-bit sets; take the strongest match first.
++        if method.contains(EncryptionMethod::BIT_128) {
++            Ok(Some(Self::Bit128))
++        } else if method.contains(EncryptionMethod::BIT_56) {
++            Ok(Some(Self::Bit56))
++        } else if method.contains(EncryptionMethod::BIT_40) {
++            Ok(Some(Self::Bit40))
++        } else if method.contains(EncryptionMethod::FIPS) {
++            Err(other_err!("rdp-security", "server selected FIPS encryption, which is not supported"))
++        } else {
++            Ok(None)
++        }
++    }
++}
++
++fn md5(parts: &[&[u8]]) -> [u8; 16] {
++    use md5::{Digest as _, Md5};
++
++    let mut hasher = Md5::new();
++    for part in parts {
++        hasher.update(part);
++    }
++    hasher.finalize().into()
++}
++
++fn sha1(parts: &[&[u8]]) -> [u8; 20] {
++    use sha1::{Digest as _, Sha1};
++
++    let mut hasher = Sha1::new();
++    for part in parts {
++        hasher.update(part);
++    }
++    hasher.finalize().into()
++}
++
++/// `SaltedHash(Salt, Input, Salt1, Salt2) = MD5(Salt + SHA1(Input + Salt + Salt1 + Salt2))`
++fn salted_hash(salt: &[u8; 48], input: &[u8], salt1: &[u8; 32], salt2: &[u8; 32]) -> [u8; 16] {
++    let sha1_digest = sha1(&[input, salt, salt1, salt2]);
++    md5(&[salt, &sha1_digest])
++}
++
++fn premaster_hash(input: &[u8], pre_master: &[u8; 48], client_random: &[u8; 32], server_random: &[u8; 32]) -> [u8; 16] {
++    salted_hash(pre_master, input, client_random, server_random)
++}
++
++fn master_hash(input: &[u8], master_secret: &[u8; 48], client_random: &[u8; 32], server_random: &[u8; 32]) -> [u8; 16] {
++    salted_hash(master_secret, input, server_random, client_random)
++}
++
++/// `MD5_16_32_32(in0, in1, in2) = MD5(in0[16] + in1[32] + in2[32])`
++fn md5_16_32_32(in0: &[u8], in1: &[u8; 32], in2: &[u8; 32]) -> [u8; 16] {
++    md5(&[&in0[..16], in1, in2])
++}
++
++/// `MACData = MD5(MacSaltKey + pad2 + SHA1(MacSaltKey + pad1 + len_le + data))`, first 8 bytes.
++fn mac_digest(mac_salt_key: &[u8; 16], data: &[u8]) -> [u8; 8] {
++    let length = (data.len() as u32).to_le_bytes();
++    let sha1_digest = sha1(&[mac_salt_key, &PAD1, &length, data]);
++    let digest = md5(&[mac_salt_key, &PAD2, &sha1_digest]);
++    digest[..8].try_into().expect("8 bytes")
++}
++
++/// Derived session keys for one direction pair.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct DerivedKeys {
++    /// MAC checksum key (`MacSaltKey`), 16 bytes.
++    pub mac_salt_key: [u8; 16],
++    /// Client-to-server RC4 key (salted; only [`Self::rc4_key_len`] bytes are meaningful).
++    pub client_encrypt_key: [u8; 16],
++    /// Server-to-client RC4 key.
++    pub client_decrypt_key: [u8; 16],
++    /// RC4 effective key length.
++    pub rc4_key_len: usize,
++}
++
++/// Derives the standard RDP security session keys from both randoms
++/// ([MS-RDPBCGR] 5.3.4).
++pub fn derive_keys(
++    method: RdpSecurityMethod,
++    client_random: &[u8; 32],
++    server_random: &[u8; 32],
++) -> DerivedKeys {
++    // PreMasterSecret = first 24 bytes of each random (FreeRDP
++    // `security_establish_keys`; MS-RDPBCGR 5.3.4 says "most significant 24 bytes").
++    let mut pre_master = [0u8; SECRET_LEN];
++    pre_master[..24].copy_from_slice(&client_random[..24]);
++    pre_master[24..].copy_from_slice(&server_random[..24]);
++
++    // MasterSecret = PremasterHash('A') + PremasterHash('BB') + PremasterHash('CCC')
++    let mut master_secret = [0u8; SECRET_LEN];
++    master_secret[..16].copy_from_slice(&premaster_hash(b"A", &pre_master, client_random, server_random));
++    master_secret[16..32].copy_from_slice(&premaster_hash(b"BB", &pre_master, client_random, server_random));
++    master_secret[32..].copy_from_slice(&premaster_hash(b"CCC", &pre_master, client_random, server_random));
++
++    // SessionKeyBlob = MasterHash('A') + MasterHash('BB') + MasterHash('CCC')
++    let mut session_key_blob = [0u8; SECRET_LEN];
++    session_key_blob[..16].copy_from_slice(&master_hash(b"A", &master_secret, client_random, server_random));
++    session_key_blob[16..32].copy_from_slice(&master_hash(b"BB", &master_secret, client_random, server_random));
++    session_key_blob[32..].copy_from_slice(&master_hash(b"CCC", &master_secret, client_random, server_random));
++
++    let mac_salt_key = session_key_blob[..16].try_into().expect("16 bytes");
++
++    // Client view: the server-to-client key comes first in the blob.
++    let mut client_decrypt_key = md5_16_32_32(&session_key_blob[16..], client_random, server_random);
++    let mut client_encrypt_key = md5_16_32_32(&session_key_blob[32..], client_random, server_random);
++
++    let salt_len = method.salt_len();
++    if salt_len > 0 {
++        client_decrypt_key[..salt_len].copy_from_slice(&SALT_VALUE[..salt_len]);
++        client_encrypt_key[..salt_len].copy_from_slice(&SALT_VALUE[..salt_len]);
++    }
++
++    DerivedKeys {
++        mac_salt_key,
++        client_encrypt_key,
++        client_decrypt_key,
++        rc4_key_len: method.rc4_key_len(),
++    }
++}
++
++/// One direction's RC4 stream plus its rollover bookkeeping
++/// (FreeRDP `security_encrypt` / `security_decrypt` / `security_key_update`).
++#[derive(Debug, Clone)]
++struct DirectionalStream {
++    key: [u8; 16],
++    update_key: [u8; 16],
++    key_len: usize,
++    salt_len: usize,
++    cipher: Rc4,
++    use_count: u32,
++}
++
++impl DirectionalStream {
++    fn new(key: &[u8; 16], key_len: usize, salt_len: usize) -> Self {
++        Self {
++            key: *key,
++            update_key: *key,
++            key_len,
++            salt_len,
++            cipher: Rc4::new(&key[..key_len]),
++            use_count: 0,
++        }
++    }
++
++    fn apply(&mut self, data: &mut [u8]) {
++        if self.use_count >= KEY_UPDATE_INTERVAL {
++            self.roll();
++        }
++        let encrypted = self.cipher.process(data);
++        data.copy_from_slice(&encrypted);
++        self.use_count += 1;
++    }
++
++    fn roll(&mut self) {
++        let sha1_digest = sha1(&[&self.update_key[..self.key_len], &PAD1, &self.key[..self.key_len]]);
++        let mut new_key = md5(&[&self.update_key[..self.key_len], &PAD2, &sha1_digest]);
++        let mut cipher = Rc4::new(&new_key[..self.key_len]);
++        let encrypted = cipher.process(&new_key[..self.key_len]);
++        new_key[..self.key_len].copy_from_slice(&encrypted);
++        if self.salt_len > 0 {
++            new_key[..self.salt_len].copy_from_slice(&SALT_VALUE[..self.salt_len]);
++        }
++        self.key = new_key;
++        self.cipher = Rc4::new(&self.key[..self.key_len]);
++        self.use_count = 0;
++    }
++}
++
++/// Full standard RDP security state for one session: the RC4 streams for both
++/// directions and the MAC key.
++///
++/// The RC4 stream state is continuous across every encrypted packet of the
++/// session (slow path, fast path, connector phases), so a single instance must
++/// be shared by everything that (de)serializes packets.
++#[derive(Debug, Clone)]
++pub struct RdpSecurity {
++    method: RdpSecurityMethod,
++    level: EncryptionLevel,
++    client_encrypt: DirectionalStream,
++    client_decrypt: DirectionalStream,
++    mac_salt_key: [u8; 16],
++}
++
++impl RdpSecurity {
++    /// Builds the state from both randoms. Called by the client after the
++    /// server's GCC `ServerSecurityData` has been received; the same client
++    /// random must then be sent in the Security Exchange PDU.
++    pub fn new(client_random: &[u8; CLIENT_RANDOM_LEN], server_data: &ServerSecurityData) -> PduResult<Self> {
++        let Some(server_random) = server_data.server_random else {
++            return Err(other_err!("rdp-security", "server security data has no server random"));
++        };
++
++        let method = RdpSecurityMethod::from_encryption_method(server_data.encryption_method)?
++            .ok_or_else(|| other_err!("rdp-security", "server selected no encryption method"))?;
++
++        if server_data.encryption_level == EncryptionLevel::None {
++            return Err(other_err!(
++                "rdp-security",
++                "server selected an encryption method with ENCRYPTION_LEVEL_NONE"
++            ));
++        }
++
++        let keys = derive_keys(method, client_random, &server_random);
++        Ok(Self {
++            method,
++            level: server_data.encryption_level,
++            client_encrypt: DirectionalStream::new(&keys.client_encrypt_key, keys.rc4_key_len, method.salt_len()),
++            client_decrypt: DirectionalStream::new(&keys.client_decrypt_key, keys.rc4_key_len, method.salt_len()),
++            mac_salt_key: keys.mac_salt_key,
++        })
++    }
++
++    pub fn method(&self) -> RdpSecurityMethod {
++        self.method
++    }
++
++    pub fn encryption_level(&self) -> EncryptionLevel {
++        self.level
++    }
++
++    /// MAC checksum for outgoing data (client-to-server key), computed over the
++    /// plaintext.
++    pub fn client_mac(&self, data: &[u8]) -> [u8; MAC_SIZE] {
++        mac_digest(&self.mac_salt_key, data)
++    }
++
++    /// MAC checksum for verifying incoming data (server-to-client key), computed
++    /// over the plaintext.
++    pub fn server_mac(&self, data: &[u8]) -> [u8; MAC_SIZE] {
++        mac_digest(&self.mac_salt_key, data)
++    }
++
++    /// Encrypts a client-to-server payload in place, advancing the RC4 stream.
++    pub fn encrypt(&mut self, data: &mut [u8]) {
++        self.client_encrypt.apply(data);
++    }
++
++    /// Decrypts a server-to-client payload in place, advancing the RC4 stream.
++    pub fn decrypt(&mut self, data: &mut [u8]) {
++        self.client_decrypt.apply(data);
++    }
++
++    /// Wraps a client-to-server payload in the standard RDP security envelope:
++    /// `BasicSecurityHeader(ENCRYPT | extra_flags)` + 8-byte MAC + ciphertext.
++    pub fn encrypt_outbound(&mut self, payload: &[u8], extra_flags: BasicSecurityHeaderFlags) -> PduResult<Vec<u8>> {
++        use ironrdp_core::encode_vec;
++
++        let mac = self.client_mac(payload);
++        let mut ciphertext = payload.to_vec();
++        self.encrypt(&mut ciphertext);
++
++        let header = BasicSecurityHeader {
++            flags: BasicSecurityHeaderFlags::ENCRYPT | extra_flags,
++        };
++
++        let mut out = Vec::with_capacity(BasicSecurityHeader::FIXED_PART_SIZE + MAC_SIZE + ciphertext.len());
++        out.extend_from_slice(&encode_vec(&header).map_err(|err| other_err!("encode security header", source: err))?);
++        out.extend_from_slice(&mac);
++        out.extend_from_slice(&ciphertext);
++        Ok(out)
++    }
++
++    /// Unwraps a server-to-client payload in place. The payload must start with
++    /// a `BasicSecurityHeader`; when it carries the `ENCRYPT` flag the body
++    /// (after the 8-byte MAC) is MAC-verified and decrypted in place.
++    ///
++    /// Returns the header flags and the offset of the (now plaintext) body
++    /// within `payload` — `BasicSecurityHeader::FIXED_PART_SIZE` when the
++    /// `ENCRYPT` flag was absent, `FIXED_PART_SIZE + MAC_SIZE` otherwise. The
++    /// header bytes themselves are left untouched, so decoders that expect to
++    /// consume their own security header (licensing, multitransport) keep
++    /// working unchanged.
++    pub fn decrypt_inbound(&mut self, payload: &mut [u8]) -> PduResult<(BasicSecurityHeaderFlags, usize)> {
++        use ironrdp_core::Decode as _;
++
++        let mut cursor = ironrdp_core::ReadCursor::new(payload);
++        let header = BasicSecurityHeader::decode(&mut cursor)
++            .map_err(|err| other_err!("decode security header", source: err))?;
++        let body_offset = BasicSecurityHeader::FIXED_PART_SIZE;
++
++        if !header.flags.contains(BasicSecurityHeaderFlags::ENCRYPT) {
++            return Ok((header.flags, body_offset));
++        }
++
++        let rest = &mut payload[body_offset..];
++        if rest.len() < MAC_SIZE {
++            return Err(other_err!("rdp-security", "encrypted payload is shorter than the MAC size"));
++        }
++        let (mac, ciphertext) = rest.split_at_mut(MAC_SIZE);
++        // The MAC covers the plaintext; decrypt first, then verify.
++        self.client_decrypt.apply(ciphertext);
++        let expected = mac_digest(&self.mac_salt_key, ciphertext);
++        if mac != expected.as_slice() {
++            return Err(other_err!("rdp-security", "packet MAC verification failed"));
++        }
++
++        Ok((header.flags, body_offset + MAC_SIZE))
++    }
++}
++
++/// Encrypts the 32-byte client random with the server's RSA public key for the
++/// Security Exchange PDU, returning the ciphertext sized to the modulus
++/// ([MS-RDPBCGR] 2.2.1.4.1).
++///
++/// The public key must be a PKCS#1 DER `RsaPublicKey` (as produced by
++/// [`crate::rdp::server_license::ServerCertificate::get_public_key`]).
++pub fn encrypt_client_random(client_random: &[u8; CLIENT_RANDOM_LEN], public_key_der: &[u8]) -> PduResult<Vec<u8>> {
++    let modulus_len = rsa_modulus_len(public_key_der)?;
++    let mut encrypted = encrypt_with_public_key(client_random, public_key_der)
++        .map_err(|err| other_err!("encrypt client random", source: err))?;
++
++    // Normalize to exactly one modulus worth of bytes: `encrypt_with_public_key`
++    // returns the minimal big-endian-trimmed little-endian integer plus padding.
++    if encrypted.len() > modulus_len {
++        encrypted.truncate(modulus_len);
++    } else {
++        encrypted.resize(modulus_len, 0);
++    }
++    Ok(encrypted)
++}
++
++fn rsa_modulus_len(public_key_der: &[u8]) -> PduResult<usize> {
++    use der_parser::parse_der;
++
++    let (_, der_object) = parse_der(public_key_der)
++        .map_err(|err| other_err!("parse server public key", source: err))?;
++    let sequence = der_object
++        .as_sequence()
++        .ok_or_else(|| other_err!("rdp-security", "server public key DER is not a sequence"))?;
++    let modulus = sequence
++        .first()
++        .and_then(|object| object.as_slice())
++        .ok_or_else(|| other_err!("rdp-security", "server public key has no modulus"))?;
++    Ok(modulus.len())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn derive_keys_is_deterministic_and_directional() {
++        let client_random = [0x44u8; 32];
++        let server_random = [0x55u8; 32];
++
++        let keys = derive_keys(RdpSecurityMethod::Bit128, &client_random, &server_random);
++        let again = derive_keys(RdpSecurityMethod::Bit128, &client_random, &server_random);
++        assert_eq!(keys, again);
++        assert_ne!(keys.client_encrypt_key, keys.client_decrypt_key);
++        assert_eq!(keys.rc4_key_len, 16);
++    }
++
++    #[test]
++    fn short_keys_are_salted() {
++        let client_random = [0x44u8; 32];
++        let server_random = [0x55u8; 32];
++
++        let keys40 = derive_keys(RdpSecurityMethod::Bit40, &client_random, &server_random);
++        assert_eq!(&keys40.client_encrypt_key[..3], &SALT_VALUE);
++        assert_eq!(&keys40.client_decrypt_key[..3], &SALT_VALUE);
++        assert_eq!(keys40.rc4_key_len, 8);
++
++        let keys56 = derive_keys(RdpSecurityMethod::Bit56, &client_random, &server_random);
++        assert_eq!(keys56.client_encrypt_key[0], SALT_VALUE[0]);
++        assert_eq!(keys56.rc4_key_len, 8);
++    }
++
++    #[test]
++    fn mac_is_deterministic_and_length_sensitive() {
++        let keys = derive_keys(RdpSecurityMethod::Bit128, &[0x44u8; 32], &[0x55u8; 32]);
++        let mac1 = mac_digest(&keys.mac_salt_key, b"hello");
++        let mac2 = mac_digest(&keys.mac_salt_key, b"hello");
++        let mac3 = mac_digest(&keys.mac_salt_key, b"hello!");
++        assert_eq!(mac1, mac2);
++        assert_ne!(mac1, mac3);
++    }
++
++    #[test]
++    fn security_stream_round_trips_and_advances() {
++        let client_random = [0x01u8; 32];
++        let server_random = [0x02u8; 32];
++        let server_data = ServerSecurityData {
++            encryption_method: EncryptionMethod::BIT_128,
++            encryption_level: EncryptionLevel::ClientCompatible,
++            server_random: Some(server_random),
++            server_cert: Vec::new(),
++        };
++
++        let mut security = RdpSecurity::new(&client_random, &server_data).expect("build security state");
++
++        // Round trip.
++        let mut packet = [0x41u8; 64];
++        let mac = security.client_mac(&packet);
++        security.encrypt(&mut packet);
++        assert_ne!(packet, [0x41u8; 64]);
++        security.decrypt(&mut packet);
++        assert_eq!(packet, [0x41u8; 64]);
++
++        // The MAC covers the plaintext, not the ciphertext.
++        let mac_over_ciphertext = security.client_mac(&{
++            let mut encrypted = [0x41u8; 64];
++            security.encrypt(&mut encrypted);
++            encrypted
++        });
++        assert_ne!(mac, mac_over_ciphertext);
++
++        // The RC4 stream advances across packets in both directions.
++        let mut first = [0x42u8; 32];
++        let mut second = [0x42u8; 32];
++        let mac1 = security.client_mac(&first);
++        let mac2 = security.client_mac(&second);
++        security.encrypt(&mut first);
++        security.encrypt(&mut second);
++        assert_ne!(first, second);
++        assert_ne!(mac1, mac2);
++        security.decrypt(&mut second);
++        assert_eq!(second, [0x42u8; 32]);
++    }
++
++    #[test]
++    fn key_rollover_keeps_stream_symmetric() {
++        let client_random = [0x03u8; 32];
++        let server_random = [0x04u8; 32];
++        let server_data = ServerSecurityData {
++            encryption_method: EncryptionMethod::BIT_128,
++            encryption_level: EncryptionLevel::High,
++            server_random: Some(server_random),
++            server_cert: Vec::new(),
++        };
++        let mut security = RdpSecurity::new(&client_random, &server_data).expect("build security state");
++
++        // Drive both directions past the rollover threshold and back.
++        for i in 0..KEY_UPDATE_INTERVAL + 5u32 {
++            let mut plaintext = [0x77u8; 16];
++            plaintext[0] = i as u8;
++            let mac = security.client_mac(&plaintext);
++            security.encrypt(&mut plaintext);
++            security.decrypt(&mut plaintext);
++            assert_eq!(plaintext[0], i as u8);
++            assert_eq!(mac, security.server_mac(&plaintext));
++        }
++    }
++
++    #[test]
++    fn fips_is_rejected() {
++        let server_data = ServerSecurityData {
++            encryption_method: EncryptionMethod::FIPS,
++            encryption_level: EncryptionLevel::Fips,
++            server_random: Some([0u8; 32]),
++            server_cert: Vec::new(),
++        };
++        assert!(RdpSecurity::new(&[0u8; 32], &server_data).is_err());
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/input/fast_path.rs b/crates/ironrdp-pdu/src/input/fast_path.rs
+index 9cf9e6ef..3f55df53 100644
+--- a/crates/ironrdp-pdu/src/input/fast_path.rs
++++ b/crates/ironrdp-pdu/src/input/fast_path.rs
+@@ -352,6 +352,44 @@ impl Encode for FastPathInput {
+     }
+ }
+ 
++impl FastPathInput {
++    /// Encodes the input PDU sealed with the Standard RDP Security envelope:
++    /// the header carries the `ENCRYPTED` flag and is followed by the 8-byte
++    /// MAC (computed over the plaintext events) and the RC4 ciphertext
++    /// ([MS-RDPBCGR] 2.2.8.1.2).
++    pub fn encode_secured(&self, security: &mut crate::crypto::rdp_security::RdpSecurity) -> EncodeResult<Vec<u8>> {
++        if self.0.is_empty() {
++            return Err(other_err!("Empty fast-path input"));
++        }
++
++        let data_length = self.0.iter().map(Encode::size).sum::<usize>();
++        let mut plaintext = vec![0u8; data_length];
++        {
++            let mut cursor = WriteCursor::new(&mut plaintext);
++            for event in self.0.iter() {
++                event.encode(&mut cursor)?;
++            }
++        }
++
++        let mac = security.client_mac(&plaintext);
++        let mut ciphertext = plaintext;
++        security.encrypt(&mut ciphertext);
++
++        let header = FastPathInputHeader {
++            num_events: u8::try_from(self.0.len())
++                .expect("per invariant (1..=FastPathInput::MAX_EVENTS).contains(num_events.len())"),
++            flags: EncryptionFlags::ENCRYPTED,
++            data_length: crate::crypto::rdp_security::MAC_SIZE + ciphertext.len(),
++        };
++
++        let mut out = vec![0u8; header.size()];
++        header.encode(&mut WriteCursor::new(&mut out))?;
++        out.extend_from_slice(&mac);
++        out.extend_from_slice(&ciphertext);
++        Ok(out)
++    }
++}
++
+ impl<'de> Decode<'de> for FastPathInput {
+     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+         let header = FastPathInputHeader::decode(src)?;
+diff --git a/crates/ironrdp-pdu/src/lib.rs b/crates/ironrdp-pdu/src/lib.rs
+index b8a50c37..a5de6954 100644
+--- a/crates/ironrdp-pdu/src/lib.rs
++++ b/crates/ironrdp-pdu/src/lib.rs
+@@ -26,7 +26,7 @@ pub mod x224;
+ 
+ pub(crate) mod basic_output;
+ pub(crate) mod ber;
+-pub(crate) mod crypto;
++pub mod crypto;
+ pub(crate) mod per;
+ 
+ pub use crate::basic_output::{bitmap, fast_path, pointer, slow_path, surface_commands, window};
+diff --git a/crates/ironrdp-pdu/src/rdp/headers.rs b/crates/ironrdp-pdu/src/rdp/headers.rs
+index e0bd4bb3..54e41420 100644
+--- a/crates/ironrdp-pdu/src/rdp/headers.rs
++++ b/crates/ironrdp-pdu/src/rdp/headers.rs
+@@ -1,6 +1,6 @@
+ use bitflags::bitflags;
+ use ironrdp_core::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteBuf, WriteCursor, cast_length, decode,
++    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteBuf, WriteCursor, cast_length, decode, encode_buf,
+     ensure_fixed_part_size, ensure_size, invalid_field_err, not_enough_bytes_err, other_err, read_padding,
+     unsupported_value_err, write_padding,
+ };
+@@ -125,6 +125,67 @@ pub fn encode_share_data(
+     )
+ }
+ 
++/// Encodes a [`ShareDataPdu`] wrapped in a Share Control header and an MCS Send
++/// Data Request, sealed with the Standard RDP Security envelope: a
++/// `BasicSecurityHeader` carrying the `ENCRYPT` flag, the 8-byte MAC and the
++/// RC4-encrypted body ([MS-RDPBCGR] 5.3.6).
++pub fn encode_share_data_secured(
++    initiator_id: u16,
++    channel_id: u16,
++    share_id: u32,
++    pdu: ShareDataPdu,
++    security: &mut crate::crypto::rdp_security::RdpSecurity,
++    buf: &mut WriteBuf,
++) -> EncodeResult<usize> {
++    let share_data_header = ShareDataHeader {
++        share_data_pdu: pdu,
++        stream_priority: StreamPriority::Medium,
++        compression_flags: CompressionFlags::empty(),
++        compression_type: client_info::CompressionType::K8, // ignored if CompressionFlags::empty()
++    };
++
++    encode_share_control_secured(
++        initiator_id,
++        channel_id,
++        share_id,
++        ShareControlPdu::Data(share_data_header),
++        security,
++        buf,
++    )
++}
++
++/// Encodes a [`ShareControlPdu`] wrapped in an MCS Send Data Request, sealed
++/// with the Standard RDP Security envelope (see [`encode_share_data_secured`]).
++pub fn encode_share_control_secured(
++    initiator_id: u16,
++    channel_id: u16,
++    share_id: u32,
++    pdu: ShareControlPdu,
++    security: &mut crate::crypto::rdp_security::RdpSecurity,
++    buf: &mut WriteBuf,
++) -> EncodeResult<usize> {
++    use std::borrow::Cow;
++
++    let share_control_header = ShareControlHeader {
++        share_control_pdu: pdu,
++        pdu_source: initiator_id,
++        share_id,
++    };
++
++    let user_data = ironrdp_core::encode_vec(&share_control_header)?;
++    let payload = security
++        .encrypt_outbound(&user_data, BasicSecurityHeaderFlags::empty())
++        .map_err(|err| other_err!("encode secured share control", source: err))?;
++
++    let request = crate::mcs::SendDataRequest {
++        initiator_id,
++        channel_id,
++        user_data: Cow::Owned(payload),
++    };
++
++    encode_buf(&crate::x224::X224(request), buf)
++}
++
+ /// A decoded Share Control PDU together with its channel routing information.
+ #[derive(Debug, Clone)]
+ pub struct ShareControlCtx {
+diff --git a/crates/ironrdp-pdu/src/rdp/mod.rs b/crates/ironrdp-pdu/src/rdp/mod.rs
+index cc4b097a..eca1e0f8 100644
+--- a/crates/ironrdp-pdu/src/rdp/mod.rs
++++ b/crates/ironrdp-pdu/src/rdp/mod.rs
+@@ -14,6 +14,7 @@ pub mod heartbeat;
+ pub mod message_channel;
+ pub mod multitransport;
+ pub mod refresh_rectangle;
++pub mod security_exchange;
+ pub mod server_error_info;
+ pub mod server_license;
+ pub mod server_redirection;
+diff --git a/crates/ironrdp-pdu/src/rdp/security_exchange.rs b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
+new file mode 100644
+index 00000000..5860562c
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/rdp/security_exchange.rs
+@@ -0,0 +1,77 @@
++use ironrdp_core::{
++    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, decode, ensure_fixed_part_size,
++    ensure_size, invalid_field_err,
++};
++
++use crate::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
++use crate::PduResult;
++
++/// Maximum length of the RSA-encrypted client random (2048-bit modulus).
++const MAX_ENCRYPTED_RANDOM_LEN: usize = 256;
++
++/// Security Exchange PDU ([MS-RDPBCGR 2.2.1.4.1]), sent by the client during the
++/// RDP Security Commencement phase of a Standard RDP Security session.
++///
++/// The PDU consists of a Basic Security Header with the `EXCHANGE_PKT` flag,
++/// followed by the RSA-encrypted client random.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SecurityExchangePdu {
++    pub encrypted_client_random: Vec<u8>,
++}
++
++impl SecurityExchangePdu {
++    const NAME: &'static str = "SecurityExchangePdu";
++}
++
++impl Encode for SecurityExchangePdu {
++    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
++        ensure_size!(in: dst, size: self.size());
++
++        BasicSecurityHeader {
++            flags: BasicSecurityHeaderFlags::EXCHANGE_PKT,
++        }
++        .encode(dst)?;
++
++        dst.write_u32(cast_length!("encryptedClientRandomLen", self.encrypted_client_random.len(), in: dst)?);
++        dst.write_slice(&self.encrypted_client_random);
++
++        Ok(())
++    }
++
++    fn name(&self) -> &'static str {
++        Self::NAME
++    }
++
++    fn size(&self) -> usize {
++        BasicSecurityHeader::FIXED_PART_SIZE + 4 + self.encrypted_client_random.len()
++    }
++}
++
++impl<'de> Decode<'de> for SecurityExchangePdu {
++    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
++        let header = BasicSecurityHeader::decode(src)?;
++        if !header.flags.contains(BasicSecurityHeaderFlags::EXCHANGE_PKT) {
++            return Err(invalid_field_err!("flags", "not a Security Exchange PDU", in: src));
++        }
++
++        ensure_fixed_part_size!(in: src);
++        let length = cast_length!("encryptedClientRandomLen", src.read_u32(), in: src)?;
++        if length > MAX_ENCRYPTED_RANDOM_LEN {
++            return Err(invalid_field_err!("encryptedClientRandomLen", "invalid encrypted client random length", in: src));
++        }
++
++        ensure_size!(in: src, size: length);
++        let encrypted_client_random = src.read_slice(length).to_vec();
++
++        Ok(Self {
++            encrypted_client_random,
++        })
++    }
++}
++
++/// Helper mirroring the licensing-style decode: many call sites hold the payload
++/// after the MCS Send Data Indication unwrap, where the security header prefix
++/// must be inspected first. Returns the PDU after validating the header.
++pub fn decode_security_exchange(payload: &[u8]) -> PduResult<SecurityExchangePdu> {
++    decode::<SecurityExchangePdu>(&mut ReadCursor::new(payload))
++}
+diff --git a/crates/ironrdp-session/src/active_stage.rs b/crates/ironrdp-session/src/active_stage.rs
+index afed7053..5656bf95 100644
+--- a/crates/ironrdp-session/src/active_stage.rs
++++ b/crates/ironrdp-session/src/active_stage.rs
+@@ -11,6 +11,7 @@ use ironrdp_egfx::compositor::WindowUpdate;
+ use ironrdp_graphics::pointer::DecodedPointer;
+ use ironrdp_pdu::gcc::{ChannelName, Monitor};
+ use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
++use ironrdp_pdu::crypto::rdp_security::SharedRdpSecurity;
+ use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
+ use ironrdp_pdu::pointer::PointerUpdateData;
+ use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
+@@ -71,6 +72,9 @@ pub struct ActiveStageBuilder {
+     pub enable_server_pointer: bool,
+     /// Use software rendering mode for pointer bitmap generation.
+     pub pointer_software_rendering: bool,
++    /// Standard RDP Security state, taken straight from the connector's
++    /// `ConnectionResult`. `None` for enhanced security transports.
++    pub security: SharedRdpSecurity,
+ }
+ 
+ impl ActiveStageBuilder {
+@@ -86,12 +90,13 @@ impl ActiveStageBuilder {
+             pointer_software_rendering,
+         } = self;
+ 
+-        let x224_processor = x224::Processor::new(
++        let x224_processor = x224::Processor::with_security(
+             static_channels,
+             user_channel_id,
+             io_channel_id,
+             message_channel_id,
+             share_id,
++            security.clone(),
+         );
+ 
+         let fast_path_processor = fast_path::ProcessorBuilder {
+@@ -100,6 +105,7 @@ impl ActiveStageBuilder {
+             share_id,
+             enable_server_pointer,
+             pointer_software_rendering,
++            security,
+         }
+         .build();
+ 
+@@ -173,11 +179,22 @@ impl ActiveStage {
+         // Mouse move events are prevalent, so we can preallocate space for
+         // response frames + graphics update.
+         let mut output = Vec::with_capacity(events.len().div_ceil(FastPathInput::MAX_EVENTS) + 1);
+-        output.extend(
+-            encode_fastpath_input(events)?
+-                .into_iter()
+-                .map(ActiveStageOutput::ResponseFrame),
+-        );
++        let frames = match &self.security {
++            None => encode_fastpath_input(events)?,
++            Some(security) => {
++                let mut security = security.lock().expect("security context mutex poisoned");
++                events
++                    .chunks(FastPathInput::MAX_EVENTS)
++                    .map(|event_chunk| {
++                        let fastpath_input = FastPathInput::new(event_chunk.to_vec()).map_err(SessionError::decode)?;
++                        fastpath_input
++                            .encode_secured(&mut security)
++                            .map_err(SessionError::encode)
++                    })
++                    .collect::<SessionResult<Vec<_>>>()?
++            }
++        };
++        output.extend(frames.into_iter().map(ActiveStageOutput::ResponseFrame));
+         output.extend(self.move_software_pointer(image, events)?);
+ 
+         Ok(output)
+@@ -499,6 +516,7 @@ impl ActiveStage {
+             share_id,
+             enable_server_pointer,
+             pointer_software_rendering,
++            security: self.security.clone(),
+         }
+         .build();
+         // The x224 processor encodes ShareDataPdu with the server's (possibly new) share_id.
+@@ -1354,6 +1372,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: true,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+ 
+@@ -1376,6 +1395,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let response = MultitransportResponsePdu::success(42);
+@@ -1402,6 +1422,7 @@ mod tests {
+             compression_type: None,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1521,6 +1542,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: true,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1585,6 +1607,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1637,6 +1660,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1665,6 +1689,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+diff --git a/crates/ironrdp-session/src/fast_path.rs b/crates/ironrdp-session/src/fast_path.rs
+index b55bd8ec..6987132e 100644
+--- a/crates/ironrdp-session/src/fast_path.rs
++++ b/crates/ironrdp-session/src/fast_path.rs
+@@ -7,6 +7,7 @@ use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget, PointerErro
+ use ironrdp_graphics::rdp6::BitmapStreamDecoder;
+ use ironrdp_graphics::rle::RlePixelFormat;
+ use ironrdp_pdu::bitmap::BitmapUpdateData;
++use ironrdp_pdu::crypto::rdp_security::SharedRdpSecurity;
+ use ironrdp_pdu::codecs::rfx::FrameAcknowledgePdu;
+ use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdate, FastPathUpdatePdu, Fragmentation, UpdateCode};
+ use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
+@@ -142,6 +143,10 @@ pub struct Processor {
+     /// repeatedly triggering redraw traffic.
+     bitmap_recovery_requested: bool,
+     bitmap_recovery_pending: bool,
++    /// Standard RDP Security state, shared with the x224 processor: the
++    /// server-to-client RC4 stream continues across slow-path and fast-path
++    /// packets, so both processors must use the same context.
++    security: SharedRdpSecurity,
+     #[cfg(feature = "qoiz")]
+     qoiz_decompressor: qoiz::Decompressor,
+ }
+@@ -184,6 +189,36 @@ impl Processor {
+         let header = decode_cursor::<FastPathHeader>(&mut input).map_err(SessionError::decode)?;
+         trace!(fast_path_header = ?header, "Received Fast-Path packet");
+ 
++        // Standard RDP Security: an encrypted fast-path PDU carries the 8-byte
++        // MAC right after the header, followed by the RC4 ciphertext
++        // ([MS-RDPBCGR] 2.2.9.1.2.1). The bulk compression history is shared
++        // over the plaintext, so decryption must happen before any
++        // decompression.
++        let decrypted: Option<Vec<u8>>;
++        let mut input: ReadCursor<'_> = if header
++            .encryption_flags
++            .contains(ironrdp_pdu::fast_path::EncryptionFlags::ENCRYPTED)
++        {
++            let security = self.security.as_ref().ok_or_else(|| {
++                reason_err!("FastPath", "received an encrypted fast-path PDU without a security context")
++            })?;
++            let mut security = security.lock().expect("security context mutex poisoned");
++            let body = input.remaining();
++            if body.len() < ironrdp_pdu::crypto::rdp_security::MAC_SIZE {
++                return Err(reason_err!("FastPath", "encrypted fast-path PDU is shorter than the MAC size"));
++            }
++            let mut buf = body.to_vec();
++            let (mac, ciphertext) = buf.split_at_mut(ironrdp_pdu::crypto::rdp_security::MAC_SIZE);
++            security.decrypt(ciphertext);
++            if mac != security.server_mac(ciphertext) {
++                return Err(reason_err!("FastPath", "fast-path packet MAC verification failed"));
++            }
++            decrypted = Some(buf);
++            ReadCursor::new(&decrypted.as_ref().expect("just set")[ironrdp_pdu::crypto::rdp_security::MAC_SIZE..])
++        } else {
++            input
++        };
++
+         // A single FastPath output PDU can contain multiple updates.
+         // Loop over all updates within the PDU payload.
+         while !input.is_empty() {
+@@ -888,6 +923,8 @@ pub struct ProcessorBuilder {
+     /// `UpdateKind::PointerBitmap` will not be generated. Remote pointer will be drawn
+     /// via software rendering on top of the output image.
+     pub pointer_software_rendering: bool,
++    /// Standard RDP Security state (see [`Processor::security`]).
++    pub security: SharedRdpSecurity,
+ }
+ 
+ impl ProcessorBuilder {
+@@ -905,6 +942,7 @@ impl ProcessorBuilder {
+             palette: Palette::system_default(),
+             bitmap_recovery_requested: false,
+             bitmap_recovery_pending: false,
++            security: self.security,
+             #[cfg(feature = "qoiz")]
+             qoiz_decompressor: qoiz::Decompressor::default(),
+         }
+@@ -1088,6 +1126,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
+@@ -1139,6 +1178,7 @@ mod tests {
+                 share_id: 0,
+                 enable_server_pointer: false,
+                 pointer_software_rendering: false,
++    security: None,
+             }
+             .build();
+             let mut image = DecodedImage::new(PixelFormat::RgbA32, 2, 2);
+@@ -1193,6 +1233,7 @@ mod tests {
+             share_id: 1,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1231,6 +1272,7 @@ mod tests {
+             share_id: 1,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1263,6 +1305,7 @@ mod tests {
+             share_id: 1,
+             enable_server_pointer: false,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1304,6 +1347,7 @@ mod tests {
+             share_id: 1,
+             enable_server_pointer: true,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+@@ -1357,6 +1401,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: true,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         processor
+@@ -1390,6 +1435,7 @@ mod tests {
+             share_id: 0,
+             enable_server_pointer: true,
+             pointer_software_rendering: false,
++    security: None,
+         }
+         .build();
+         processor
+diff --git a/crates/ironrdp-session/src/x224/mod.rs b/crates/ironrdp-session/src/x224/mod.rs
+index 8b7360c0..4e15ab8a 100644
+--- a/crates/ironrdp-session/src/x224/mod.rs
++++ b/crates/ironrdp-session/src/x224/mod.rs
+@@ -15,10 +15,11 @@ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+ use ironrdp_pdu::rdp::session_info::{
+     InfoData, LogonErrorsInfo, LogonInfoVersion1, LogonInfoVersion2, SaveSessionInfoPdu, ServerAutoReconnect,
+ };
++use ironrdp_pdu::crypto::rdp_security::{RdpSecurity, SharedRdpSecurity};
+ use ironrdp_pdu::x224::X224;
+ use ironrdp_svc::{
+     ChannelFlags, StaticChannelSet, StaticVirtualChannel, SvcMessage, SvcProcessor, SvcProcessorMessages,
+-    client_encode_svc_messages_with_max_chunk_len,
++    client_encode_svc_messages_with_max_chunk_len, client_encode_svc_messages_with_max_chunk_len_secured,
+ };
+ use tracing::debug;
+ 
+@@ -134,6 +135,9 @@ pub struct Processor {
+     message_channel_id: Option<u16>,
+     share_id: u32,
+     auto_detect: AutoDetectResponder,
++    /// Standard RDP Security state: every SVC payload travels inside the
++    /// session-key envelope when the session runs over the legacy RC4 layer.
++    security: SharedRdpSecurity,
+ }
+ 
+ impl Processor {
+@@ -143,6 +147,24 @@ impl Processor {
+         io_channel_id: u16,
+         message_channel_id: Option<u16>,
+         share_id: u32,
++    ) -> Self {
++        Self::with_security(
++            static_channels,
++            user_channel_id,
++            io_channel_id,
++            message_channel_id,
++            share_id,
++            None,
++        )
++    }
++
++    pub fn with_security(
++        static_channels: StaticChannelSet,
++        user_channel_id: u16,
++        io_channel_id: u16,
++        message_channel_id: Option<u16>,
++        share_id: u32,
++        security: SharedRdpSecurity,
+     ) -> Self {
+         Self {
+             static_channels,
+@@ -151,6 +173,7 @@ impl Processor {
+             message_channel_id,
+             share_id,
+             auto_detect: AutoDetectResponder::default(),
++            security,
+         }
+     }
+ 
+@@ -197,6 +220,7 @@ impl Processor {
+             self.user_channel_id,
+             self.static_channels.maximum_chunk_size(),
+             self.static_channels.get_by_channel_id(channel_id),
++            &self.security,
+         )
+     }
+ 
+@@ -217,6 +241,7 @@ impl Processor {
+             self.user_channel_id,
+             self.static_channels.maximum_chunk_size(),
+             self.static_channels.get_by_channel_id(channel_id),
++            &self.security,
+         )
+     }
+ 
+@@ -263,6 +288,36 @@ impl Processor {
+                 return Err(SessionError::decode(error));
+             }
+         };
++        // Standard RDP Security: unwrap the session-key envelope. The outer
++        // security header stays in place for the message channel (its decoders
++        // parse their own headers) and for the standard-security Server
++        // Redirection variant; everything else is stripped down to the plaintext
++        // Share Control payload.
++        let data_ctx: SendDataIndicationCtx<'_> = match &self.security {
++            None => data_ctx,
++            Some(security) => {
++                let mut user_data = data_ctx.user_data.into_owned();
++                let (flags, body_offset) = security
++                    .lock()
++                    .expect("security context mutex poisoned")
++                    .decrypt_inbound(&mut user_data)
++                    .map_err(SessionError::decode)?;
++
++                let keep_header = self.message_channel_id == Some(data_ctx.channel_id)
++                    || flags.contains(BasicSecurityHeaderFlags::REDIRECTION_PKT);
++                let user_data = if keep_header {
++                    user_data
++                } else {
++                    user_data[body_offset..].to_vec()
++                };
++
++                SendDataIndicationCtx {
++                    initiator_id: data_ctx.initiator_id,
++                    channel_id: data_ctx.channel_id,
++                    user_data: std::borrow::Cow::Owned(user_data),
++                }
++            }
++        };
+         let channel_id = data_ctx.channel_id;
+ 
+         if channel_id == self.io_channel_id {
+@@ -282,6 +337,7 @@ impl Processor {
+                     data_ctx.initiator_id,
+                     maximum_chunk_size,
+                     Some(&*svc),
++                    &self.security,
+                 )
+                 .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
+             } else {
+@@ -613,14 +669,25 @@ impl Processor {
+ 
+     /// Send a pdu on the static global channel. Typically used to send input events
+     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
+-        let written = ironrdp_pdu::rdp::headers::encode_share_data(
+-            self.user_channel_id,
+-            self.io_channel_id,
+-            self.share_id,
+-            pdu,
+-            output,
+-        )
+-        .map_err(SessionError::encode)?;
++        let written = match &self.security {
++            Some(security) => ironrdp_pdu::rdp::headers::encode_share_data_secured(
++                self.user_channel_id,
++                self.io_channel_id,
++                self.share_id,
++                pdu,
++                &mut security.lock().expect("security context mutex poisoned"),
++                output,
++            )
++            .map_err(SessionError::encode)?,
++            None => ironrdp_pdu::rdp::headers::encode_share_data(
++                self.user_channel_id,
++                self.io_channel_id,
++                self.share_id,
++                pdu,
++                output,
++            )
++            .map_err(SessionError::encode)?,
++        };
+         Ok(written)
+     }
+ }
+@@ -647,6 +714,7 @@ fn process_svc_messages(
+     initiator_id: u16,
+     maximum_chunk_size: usize,
+     channel: Option<&StaticVirtualChannel>,
++    security: &SharedRdpSecurity,
+ ) -> SessionResult<Vec<u8>> {
+     let messages = if channel.is_some_and(|channel| channel.channel_options().contains(ChannelOptions::SHOW_PROTOCOL)) {
+         messages
+@@ -656,8 +724,26 @@ fn process_svc_messages(
+     } else {
+         messages
+     };
+-    client_encode_svc_messages_with_max_chunk_len(messages, channel_id, initiator_id, maximum_chunk_size)
+-        .map_err(SessionError::encode)
++    match security {
++        None => client_encode_svc_messages_with_max_chunk_len(messages, channel_id, initiator_id, maximum_chunk_size)
++            .map_err(SessionError::encode),
++        Some(security) => {
++            let mut security = security.lock().expect("security context mutex poisoned");
++            client_encode_svc_messages_with_max_chunk_len_secured(
++                messages,
++                channel_id,
++                initiator_id,
++                maximum_chunk_len,
++                &mut |chunk: &mut [u8]| {
++                    *chunk = security
++                        .encrypt_outbound(chunk, BasicSecurityHeaderFlags::empty())
++                        .map_err(SessionError::encode)?;
++                    Ok(())
++                },
++            )
++            .map_err(SessionError::encode)
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/ironrdp-svc/src/lib.rs b/crates/ironrdp-svc/src/lib.rs
+index 7bab808e..86c86a09 100644
+--- a/crates/ironrdp-svc/src/lib.rs
++++ b/crates/ironrdp-svc/src/lib.rs
+@@ -206,6 +206,16 @@ fn encode_svc_messages(
+     initiator_id: u16,
+     client: bool,
+     max_chunk_len: usize,
++) -> EncodeResult<Vec<u8>> {
++    encode_svc_messages_secured(messages, channel_id, initiator_id, max_chunk_len, &mut |_| Ok(()))
++}
++
++fn encode_svc_messages_secured(
++    messages: Vec<SvcMessage>,
++    channel_id: u16,
++    initiator_id: u16,
++    max_chunk_len: usize,
++    secure: &mut dyn FnMut(&mut [u8]) -> EncodeResult<()>,
+ ) -> EncodeResult<Vec<u8>> {
+     let mut fully_encoded_responses = WriteBuf::new(); // TODO(perf): reuse this buffer using `clear` and `filled` as appropriate
+ 
+@@ -221,11 +231,12 @@ fn encode_svc_messages(
+     // [ | tpkt | x224 | mcs::SendDataRequest | chunk 1 | tpkt | x224 | mcs::SendDataRequest | chunk 2 | ]
+     //   |<------------------- PDU 1 ------------------>|<------------------- PDU 2 ------------------>|
+     if client {
+-        for chunk in chunks {
++        for mut chunk in chunks {
++            secure(chunk.filled_mut())?;
+             let pdu = mcs::SendDataRequest {
+                 initiator_id,
+                 channel_id,
+-                user_data: Cow::Borrowed(chunk.filled()),
++                user_data: Cow::Owned(chunk.into_inner()),
+             };
+             encode_buf(&X224(pdu), &mut fully_encoded_responses)?;
+         }
+@@ -267,6 +278,23 @@ pub fn client_encode_svc_messages_with_max_chunk_len(
+     encode_svc_messages(messages, channel_id, initiator_id, true, max_chunk_len)
+ }
+ 
++/// Same as [`client_encode_svc_messages_with_max_chunk_len`], but each chunk is
++/// passed through `secure` before being wrapped in its MCS Send Data Request.
++///
++/// Used by the Standard RDP Security transport, where every static channel
++/// chunk is sealed with the session-key envelope (security header + MAC +
++/// RC4 ciphertext); the chunking itself still applies to the plaintext, per
++/// the negotiated `VCChunkSize`.
++pub fn client_encode_svc_messages_with_max_chunk_len_secured(
++    messages: Vec<SvcMessage>,
++    channel_id: u16,
++    initiator_id: u16,
++    max_chunk_len: usize,
++    secure: &mut dyn FnMut(&mut [u8]) -> EncodeResult<()>,
++) -> EncodeResult<Vec<u8>> {
++    encode_svc_messages_secured(messages, channel_id, initiator_id, max_chunk_len, secure)
++}
++
+ /// Encode a vector of [`SvcMessage`] in preparation for sending them on the `channel_id` channel.
+ ///
+ /// This includes chunkifying the messages, adding MCS, x224, and tpkt headers, and encoding them into a buffer.
+diff --git a/crates/ironrdp-testsuite-core/tests/rdpemsc/mod.rs b/crates/ironrdp-testsuite-core/tests/rdpemsc/mod.rs
+index 63a235ca..743685f0 100644
+--- a/crates/ironrdp-testsuite-core/tests/rdpemsc/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/rdpemsc/mod.rs
+@@ -100,6 +100,7 @@ fn active_stage() -> ActiveStage {
+         compression_type: None,
+         enable_server_pointer: true,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build()
+ }
+diff --git a/crates/ironrdp-testsuite-core/tests/session/active_stage.rs b/crates/ironrdp-testsuite-core/tests/session/active_stage.rs
+index 47202352..475ca155 100644
+--- a/crates/ironrdp-testsuite-core/tests/session/active_stage.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/active_stage.rs
+@@ -328,6 +328,7 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
+         compression_type: None,
+         enable_server_pointer: false,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build();
+ 
+diff --git a/crates/ironrdp-testsuite-core/tests/session/autodetect.rs b/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
+index daa74bd4..8409c6a8 100644
+--- a/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
+@@ -400,6 +400,7 @@ fn make_active_stage() -> ActiveStage {
+         compression_type: None,
+         enable_server_pointer: false,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build()
+ }
+diff --git a/crates/ironrdp-testsuite-core/tests/session/fastpath_input.rs b/crates/ironrdp-testsuite-core/tests/session/fastpath_input.rs
+index 7bf3d9e1..f2f14705 100644
+--- a/crates/ironrdp-testsuite-core/tests/session/fastpath_input.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/fastpath_input.rs
+@@ -78,6 +78,7 @@ fn active_stage_sends_the_same_frames() {
+         compression_type: None,
+         enable_server_pointer: true,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build();
+     let mut image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
+diff --git a/crates/ironrdp-testsuite-core/tests/svc.rs b/crates/ironrdp-testsuite-core/tests/svc.rs
+index 8c652a41..d4e47aea 100644
+--- a/crates/ironrdp-testsuite-core/tests/svc.rs
++++ b/crates/ironrdp-testsuite-core/tests/svc.rs
+@@ -725,6 +725,7 @@ fn session_chunks_omit_show_protocol_without_the_channel_option() {
+         compression_type: None,
+         enable_server_pointer: false,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build();
+ 
+@@ -760,6 +761,7 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
+         compression_type: None,
+         enable_server_pointer: false,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build();
+     assert!(active_stage.reactivate(1003, 1002, 2, false, false, 4096));
+diff --git a/crates/ironrdp-testsuite-extra/tests/client/core_input.rs b/crates/ironrdp-testsuite-extra/tests/client/core_input.rs
+index 186b1181..cb216308 100644
+--- a/crates/ironrdp-testsuite-extra/tests/client/core_input.rs
++++ b/crates/ironrdp-testsuite-extra/tests/client/core_input.rs
+@@ -76,6 +76,7 @@ fn stage(core_input: bool, software_pointer: bool) -> ActiveStage {
+         compression_type: None,
+         enable_server_pointer: software_pointer,
+         pointer_software_rendering: software_pointer,
++        security: None,
+     }
+     .build()
+ }
+diff --git a/crates/ironrdp-testsuite-extra/tests/e2e.rs b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+index 3fbe6121..84b4737d 100644
+--- a/crates/ironrdp-testsuite-extra/tests/e2e.rs
++++ b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+@@ -346,6 +346,7 @@ async fn largest_fast_path_update(client_max_request_size: u32) -> usize {
+                         compression_type: connection_result.compression_type,
+                         enable_server_pointer: connection_result.enable_server_pointer,
+                         pointer_software_rendering: connection_result.pointer_software_rendering,
++                        security: None,
+                     }
+                     .build();
+ 
+@@ -586,6 +587,7 @@ fn test_reactivation_preserves_bulk_decompression_history() {
+         compression_type: Some(PduCompressionType::K64),
+         enable_server_pointer: false,
+         pointer_software_rendering: false,
++        security: None,
+     }
+     .build();
+ 
+@@ -841,6 +843,7 @@ async fn run_failing_display_probe(
+             compression_type: connection_result.compression_type,
+             enable_server_pointer: connection_result.enable_server_pointer,
+             pointer_software_rendering: connection_result.pointer_software_rendering,
++            security: None,
+         }
+         .build();
+         let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+@@ -2065,6 +2068,7 @@ async fn client_server_with_display<D, DF, F, Fut, C>(
+                     compression_type: connection_result.compression_type,
+                     enable_server_pointer: connection_result.enable_server_pointer,
+                     pointer_software_rendering: connection_result.pointer_software_rendering,
++                    security: None,
+                 }
+                 .build();
+                 let (active_stage, mut upgraded_framed) = clientfn(
+@@ -2235,6 +2239,7 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
+                     compression_type: connection_result.compression_type,
+                     enable_server_pointer: connection_result.enable_server_pointer,
+                     pointer_software_rendering: connection_result.pointer_software_rendering,
++                    security: None,
+                 }
+                 .build();
+                 stage.enable_reliable_udp_dvc_tunnel().expect("DRDYNVC is present");
+@@ -2477,6 +2482,7 @@ async fn egfx_windows(core_frame_ack_limit: Option<bool>) -> (u32, u32) {
+                 compression_type: connection_result.compression_type,
+                 enable_server_pointer: connection_result.enable_server_pointer,
+                 pointer_software_rendering: connection_result.pointer_software_rendering,
++                security: None,
+             }
+             .build();
+             let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+@@ -2770,6 +2776,7 @@ async fn connect_active_client(
+         compression_type: connection_result.compression_type,
+         enable_server_pointer: connection_result.enable_server_pointer,
+         pointer_software_rendering: connection_result.pointer_software_rendering,
++        security: None,
+     }
+     .build();
+ 
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+index 403b738d..b8a2d1a1 100644
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -758,6 +758,7 @@ impl iron_remote_desktop::Session for Session {
+             compression_type: connection_result.compression_type,
+             enable_server_pointer: connection_result.enable_server_pointer,
+             pointer_software_rendering: connection_result.pointer_software_rendering,
++            security: connection_result.security_ctx,
+         }
+         .build();
+ 
+@@ -1550,8 +1551,12 @@ fn build_config(
+     connector::Config {
+         credentials: Credentials::UsernamePassword { username, password },
+         domain,
+-        enable_tls: !security.enable_standard_rdp_security,
+-        enable_credssp: security.enable_credssp && !security.enable_standard_rdp_security,
++        // Standard RDP Security is an additional acceptance, not a replacement:
++        // the client still advertises SSL/HYBRID, but a server that selects
++        // PROTOCOL_RDP (e.g. xrdp configured with security_layer=rdp) is
++        // connected via the legacy RC4 layer instead of failing.
++        enable_tls: true,
++        enable_credssp: security.enable_credssp,
+         enable_standard_rdp_security: security.enable_standard_rdp_security,
+         keyboard_type: ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED,
+         keyboard_subtype: 0,
+diff --git a/crates/ironrdp/examples/screenshot.rs b/crates/ironrdp/examples/screenshot.rs
+index df40cc69..f852a13e 100644
+--- a/crates/ironrdp/examples/screenshot.rs
++++ b/crates/ironrdp/examples/screenshot.rs
+@@ -440,6 +440,7 @@ fn active_stage(
+         compression_type: connection_result.compression_type,
+         enable_server_pointer: connection_result.enable_server_pointer,
+         pointer_software_rendering: connection_result.pointer_software_rendering,
++        security: None,
+     }
+     .build();
+     capture_frames(
+-- 
+2.56.0.windows.2
+
