@@ -28,3 +28,17 @@ profile instead of the hardcoded `ConnectionType::Lan` +
 Both are optional: when absent the previous hardcoded behavior is kept.
 Regenerate against a fresh IronRDP checkout if `git apply` fails after an
 upstream change.
+
+## 0004-tolerate-pdus-during-finalization.patch
+
+During connection finalization the client sends the Font List PDU and waits
+for the Font Map PDU. MS-RDPBCGR already lets the server start sending share
+traffic (graphics updates, pointer shapes, session info, ...) once Confirm
+Active has been processed, so those PDUs legitimately race with the Font Map.
+Upstream treated any non-finalization PDU in that window as a hard error
+(`unexpected server message`), killing connections intermittently depending
+on server/network timing. The patch skips the benign PDUs (SaveSessionInfo,
+FrameAcknowledge, SuppressOutput, RefreshRectangle, Update, Pointer,
+PlaySound, SetKeyboardIndicators, SetKeyboardImeStatus, StatusInfoPdu) and
+keeps waiting; genuinely unexpected PDUs now fail with the PDU short name in
+the error message instead of a bare string.
