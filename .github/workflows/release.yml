@@ -17,11 +17,15 @@ permissions:
   contents: write
 
 env:
-  IRONRDP_REPO: https://github.com/Devolutions/IronRDP
-  # Pinned known-good IronRDP revision. Newer upstream commits can break the
-  # protocol against real servers — bump this deliberately after testing a
-  # fresh checkout, never implicitly via master HEAD.
-  IRONRDP_SHA: 905c28b3a4e67b15fac274c5d808ef3cef0eb813
+  # TEST BUILD (branch test/rdpsec-pr2105): builds Devolutions/IronRDP PR
+  # #2105 (Standard RDP Security client support, single commit 87bcb566)
+  # merged onto the pinned known-good revision 905c28b3 (chosen because it
+  # answers late Auto-Detect Requests; bump deliberately, never implicitly
+  # via master HEAD). The merged result lives in the ys-ll fork at
+  # rdpsec-merged. Revert both values to the upstream repo / pinned SHA
+  # before cutting a formal release from main.
+  IRONRDP_REPO: https://github.com/ys-ll/IronRDP
+  IRONRDP_SHA: 4409907a4b2f80f76c9833cc0bed31faed3eed3b
 
 jobs:
   build:
