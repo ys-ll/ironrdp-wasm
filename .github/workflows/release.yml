@@ -25,7 +25,7 @@ env:
   # rdpsec-merged. Revert both values to the upstream repo / pinned SHA
   # before cutting a formal release from main.
   IRONRDP_REPO: https://github.com/ys-ll/IronRDP
-  IRONRDP_SHA: 824e91a346b44e5553ee53ba06a22a550015f48b
+  IRONRDP_SHA: e85e513fb0f21b2241e590f863c318784b6807d2
 
 jobs:
   build:
