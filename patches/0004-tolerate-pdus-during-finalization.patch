@@ -1,0 +1,40 @@
+diff --git a/crates/ironrdp-connector/src/connection_finalization.rs b/crates/ironrdp-connector/src/connection_finalization.rs
+index 672a1494..d2f42e87 100644
+--- a/crates/ironrdp-connector/src/connection_finalization.rs
++++ b/crates/ironrdp-connector/src/connection_finalization.rs
+@@ -267,7 +267,34 @@ impl Sequence for ConnectionFinalizationSequence {
+ 
+                         ConnectionFinalizationState::Finished
+                     }
+-                    _ => return Err(general_err!("unexpected server message")),
++                    // MS-RDPBCGR lets the server start sending share traffic
++                    // (graphics updates, pointer shapes, session info, ...) once
++                    // the Confirm Active PDU has been processed, so these PDUs
++                    // legitimately race with the Font Map during finalization.
++                    // Skip them and keep waiting instead of failing the connect.
++                    ShareDataPdu::SaveSessionInfo(_)
++                    | ShareDataPdu::FrameAcknowledge(_)
++                    | ShareDataPdu::SuppressOutput(_)
++                    | ShareDataPdu::RefreshRectangle(_)
++                    | ShareDataPdu::Update(_)
++                    | ShareDataPdu::Pointer(_)
++                    | ShareDataPdu::PlaySound(_)
++                    | ShareDataPdu::SetKeyboardIndicators(_)
++                    | ShareDataPdu::SetKeyboardImeStatus(_)
++                    | ShareDataPdu::StatusInfoPdu(_) => {
++                        debug!(
++                            pdu = ctx.pdu.as_short_name(),
++                            "Skipped a non-finalization PDU while waiting for the Font Map",
++                        );
++                        ConnectionFinalizationState::WaitForResponse
++                    }
++                    _ => {
++                        return Err(reason_err!(
++                            "connection finalization",
++                            "unexpected server message: {}",
++                            ctx.pdu.as_short_name(),
++                        ));
++                    }
+                 };
+ 
+                 (Written::Nothing, next_state)
