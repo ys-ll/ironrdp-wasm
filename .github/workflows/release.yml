@@ -54,8 +54,23 @@ jobs:
             git -C ironrdp apply --whitespace=nowarn "$GITHUB_WORKSPACE/$p"
           done
 
-      - name: Build ironrdp-web for WASM
+      - name: Build ironrdp-web for WASM (production profile)
+        env:
+          # Override the default release profile with the settings of the
+          # upstream `production-wasm` profile (opt-level=s, LTO, 1 codegen
+          # unit) via cargo's CARGO_PROFILE_* env vars, so the smaller binary
+          # applies regardless of the wasm-pack version in use.
+          CARGO_PROFILE_RELEASE_LTO: "true"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         run: wasm-pack build ironrdp/crates/ironrdp-web --target web --release --out-dir "$GITHUB_WORKSPACE/pkg" --out-name ironrdp
+
+      - name: Optimize wasm with binaryen
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+          wasm-opt pkg/ironrdp_bg.wasm -Oz --strip-dwarf --strip-producers -o pkg/ironrdp_bg.wasm
+          echo "Final wasm size:"
+          ls -la pkg/ironrdp_bg.wasm
 
       - name: Rebrand package as @ys-ll/ironrdp-wasm
         env:
