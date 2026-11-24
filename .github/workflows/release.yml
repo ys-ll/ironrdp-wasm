@@ -24,7 +24,7 @@ env:
   # fork at rdpsec-merged — switch IRONRDP_REPO back to upstream once
   # Devolutions/IronRDP#2105 lands.
   IRONRDP_REPO: https://github.com/ys-ll/IronRDP
-  IRONRDP_SHA: e7b1cf671771d0c8a86cf0befe841a0ee3f1f9cb
+  IRONRDP_SHA: cc04c66833e0e1fce0ab2d0f0825f46999f3c983
 
 jobs:
   build:
