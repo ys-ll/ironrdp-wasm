@@ -1,0 +1,86 @@
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -41,6 +41,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+ use ironrdp::session::image::DecodedImage;
+ use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+ use ironrdp_core::WriteBuf;
++use ironrdp_futures::bytes::BytesMut;
+ use ironrdp_futures::FramedWrite;
+ use rgb::AsPixels as _;
+ use tap::prelude::*;
+@@ -558,7 +559,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+ 
+         let use_display_control = self.0.borrow().use_display_control;
+ 
+-        let (connection_result, ws) = connect(ConnectParams {
++        let (connection_result, ws, framed_leftover) = connect(ConnectParams {
+             ws,
+             config,
+             proxy_auth_token: auth_token,
+@@ -596,6 +597,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+ 
+             input_events_rx: RefCell::new(Some(input_events_rx)),
+             rdp_reader: RefCell::new(Some(rdp_reader)),
++            framed_leftover: RefCell::new(Some(framed_leftover)),
+             connection_result: RefCell::new(Some(connection_result)),
+             clipboard: RefCell::new(Some(clipboard)),
+             printer: RefCell::new(Some(printer)),
+@@ -646,6 +648,10 @@ pub(crate) struct Session {
+     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
+     connection_result: RefCell<Option<connector::ConnectionResult>>,
+     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
++    // The framed reader's leftover from the connection phase: the server may
++    // send its first session PDUs in the same WebSocket message as the last
++    // connection PDU, and dropping them loses the first graphics update.
++    framed_leftover: RefCell<Option<ironrdp_futures::bytes::BytesMut>>,
+     clipboard: RefCell<Option<Option<WasmClipboard>>>,
+     printer: RefCell<Option<Option<WasmPrinter>>>,
+ }
+@@ -718,7 +724,18 @@ impl iron_remote_desktop::Session for Session {
+         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
+         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
+ 
+-        let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
++        // Seed the session's framed reader with the bytes buffered during the
++        // connection phase: the server may send its first session PDUs in the
++        // same WebSocket message as the last connection PDU, and dropping the
++        // leftover loses them (the DVC capabilities, the first graphics
++        // update), leaving a connected-but-black session.
++        let framed_leftover = self
++            .framed_leftover
++            .borrow_mut()
++            .take()
++            .unwrap_or_else(BytesMut::new);
++        let mut framed =
++            ironrdp_futures::LocalFuturesFramed::new_with_leftover(rdp_reader, framed_leftover);
+ 
+         debug!("Initialize canvas");
+ 
+@@ -1726,7 +1743,7 @@ async fn connect(
+         computer_name,
+         use_display_control,
+     }: ConnectParams,
+-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
++) -> Result<(connector::ConnectionResult, WebSocket, ironrdp_futures::bytes::BytesMut), IronError> {
+     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
+ 
+     // In web browser environments, we do not have an easy access to the local address of the socket.
+@@ -1796,9 +1813,15 @@ async fn connect(
+     .await?
+     .into_connected()?;
+ 
+-    let ws = framed.into_inner_no_leftover();
++    // A server may send its first session PDUs right behind the last
++    // connection PDU, and a coalescing proxy delivers them in the same
++    // WebSocket message: dropping the framed reader's leftover here loses
++    // them (the DVC capabilities, the first graphics update), leaving a
++    // connected-but-black session. Return the leftover with the WebSocket
++    // and seed the session's framed reader with it.
++    let (ws, leftover) = framed.into_inner();
+ 
+-    Ok((connection_result, ws))
++    Ok((connection_result, ws, leftover))
+ }
+ 
+ struct RDCleanPathConnectParams {

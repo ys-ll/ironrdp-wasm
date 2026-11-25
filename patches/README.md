@@ -42,3 +42,19 @@ FrameAcknowledge, SuppressOutput, RefreshRectangle, Update, Pointer,
 PlaySound, SetKeyboardIndicators, SetKeyboardImeStatus, StatusInfoPdu) and
 keeps waiting; genuinely unexpected PDUs now fail with the PDU short name in
 the error message instead of a bare string.
+
+## 0005-preserve-framed-reader-leftover.patch
+
+Preserves bytes buffered by the connection-phase framed reader when starting
+the active session. Dropping these bytes can lose the initial DVC handshake
+or graphics update and leave a connected session black. This keeps the
+connection fix without retaining the post-v0.5.6 diagnostic log callback.
+
+## 0006-enable-egfx-in-web-client.patch
+
+Registers the existing IronRDP graphics pipeline (EGFX) dynamic channel in
+`ironrdp-web` and advertises support in the early client capabilities.
+Windows Server 2012 sends desktop frames over EGFX in this configuration;
+without the channel, authentication succeeds but the web canvas stays black.
+The channel uses the built-in non-H.264 codecs and reuses the session's
+existing compositor-to-canvas path. Display Control remains optional.

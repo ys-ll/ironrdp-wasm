@@ -1,0 +1,40 @@
+diff --git a/crates/ironrdp-web/Cargo.toml b/crates/ironrdp-web/Cargo.toml
+--- a/crates/ironrdp-web/Cargo.toml
++++ b/crates/ironrdp-web/Cargo.toml
+@@ -39,3 +39,4 @@
+ ] }
+ ironrdp-core.path = "../ironrdp-core"
++ironrdp-egfx.path = "../ironrdp-egfx"
+ ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -42,3 +42,4 @@
+ use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+ use ironrdp_core::WriteBuf;
++use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+ use ironrdp_futures::bytes::BytesMut;
+@@ -1669,3 +1670,3 @@
+         multitransport_flags: None,
+-        support_dyn_vc_gfx_protocol: false,
++        support_dyn_vc_gfx_protocol: true,
+         rdp_version: ironrdp::pdu::gcc::RdpVersion::V5_PLUS,
+@@ -1769,11 +1823,15 @@ async fn connect(
+         );
+     }
+ 
++    struct EgfxHandler;
++    impl GraphicsPipelineHandler for EgfxHandler {}
++
++    let mut drdynvc =
++        DrdynvcClient::new().with_dynamic_channel(GraphicsPipelineClient::new(Box::new(EgfxHandler), None));
+     if use_display_control {
+-        connector.attach_static_channel(
+-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
+-        );
++        drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+     }
++    connector.attach_static_channel(drdynvc);
+ 
+     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
+         .ok()
