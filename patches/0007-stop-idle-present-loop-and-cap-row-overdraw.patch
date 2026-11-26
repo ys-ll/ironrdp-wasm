@@ -1,0 +1,500 @@
+diff --git a/crates/ironrdp-web/Cargo.toml b/crates/ironrdp-web/Cargo.toml
+index 4ef2be3..489a290 100644
+--- a/crates/ironrdp-web/Cargo.toml
++++ b/crates/ironrdp-web/Cargo.toml
+@@ -14,7 +14,6 @@ categories.workspace = true
+ 
+ [lib]
+ doctest = false
+-test = false
+ crate-type = ["cdylib", "rlib"]
+ 
+ [features]
+diff --git a/crates/ironrdp-web/src/canvas.rs b/crates/ironrdp-web/src/canvas.rs
+index 423606f..f88bae6 100644
+--- a/crates/ironrdp-web/src/canvas.rs
++++ b/crates/ironrdp-web/src/canvas.rs
+@@ -1,7 +1,8 @@
+ use core::cell::RefCell;
+ use core::num::NonZeroU32;
+-#[cfg(target_arch = "wasm32")]
+ use std::rc::Rc;
++#[cfg(target_arch = "wasm32")]
++use std::rc::Weak;
+ 
+ #[cfg(target_arch = "wasm32")]
+ use anyhow::anyhow;
+@@ -18,6 +19,10 @@ use web_sys::{
+     WebGlTexture,
+ };
+ 
++#[cfg(target_arch = "wasm32")]
++use crate::present_loop::PresentLoopState;
++use crate::present_loop::PresentLoop;
++
+ /// Web render surface: blits each dirty region onto the canvas.
+ ///
+ /// Prefers a WebGL2 path — the whole desktop lives in one GPU texture, each
+@@ -36,6 +41,7 @@ use web_sys::{
+ pub(crate) struct Canvas {
+     canvas: HtmlCanvasElement,
+     renderer: Rc<RefCell<Renderer>>,
++    present_loop: PresentLoop,
+ }
+ 
+ impl Canvas {
+@@ -49,11 +55,21 @@ impl Canvas {
+         let renderer = Rc::new(RefCell::new(renderer));
+ 
+         #[cfg(target_arch = "wasm32")]
+-        spawn_present_loop(renderer.clone());
++        let present_loop = {
++            let present_loop = PresentLoop::new();
++            // The loop keeps only a weak renderer, so dropping this Canvas is
++            // enough to free the GPU resources once the loop runs its last
++            // (Stop) tick.
++            spawn_present_loop(Rc::downgrade(&renderer), present_loop.shared_state());
++            present_loop
++        };
++        #[cfg(not(target_arch = "wasm32"))]
++        let present_loop = PresentLoop::new();
+ 
+         Ok(Self {
+             canvas: render_canvas,
+             renderer,
++            present_loop,
+         })
+     }
+ 
+@@ -66,7 +82,12 @@ impl Canvas {
+     }
+ 
+     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+-        self.renderer.borrow().draw(buffer, region)
++        if buffer.is_empty() {
++            return Ok(());
++        }
++        self.renderer.borrow().draw(buffer, region)?;
++        self.present_loop.mark_dirty();
++        Ok(())
+     }
+ }
+ 
+@@ -427,26 +448,72 @@ fn context_2d(canvas: &HtmlCanvasElement) -> anyhow::Result<CanvasRenderingConte
+ }
+ 
+ /// Spawns the requestAnimationFrame loop that presents the composed texture
+-/// once per display frame. The renderer is kept alive by the closure for the
+-/// lifetime of the page.
++/// once per display frame.
++///
++/// The closure holds only a weak renderer and the shared state, so it cannot
++/// keep the renderer/texture alive. It presents only when a region was
++/// uploaded since the last tick and unregisters itself once the owning
++/// `Canvas` reports `FrameAction::Stop`.
+ #[cfg(target_arch = "wasm32")]
+-fn spawn_present_loop(renderer: Rc<RefCell<Renderer>>) {
++fn spawn_present_loop(renderer: Weak<RefCell<Renderer>>, state: Rc<RefCell<PresentLoopState>>) {
+     use wasm_bindgen::prelude::Closure;
+ 
+     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+     let g = f.clone();
+     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+-        renderer.borrow().present();
+-        let window = web_sys::window().expect("no window");
+-        let scheduled = f.borrow();
+-        let next = scheduled.as_ref().unwrap().as_ref().unchecked_ref();
+-        window
+-            .request_animation_frame(next)
+-            .expect("failed to schedule the next present");
++        let action = state.borrow_mut().next_frame();
++        match action {
++            crate::present_loop::FrameAction::Stop => {
++                // Taking the closure out of its own slot from inside the
++                // callback breaks the Rc -> Closure -> Rc cycle, which frees
++                // the shared state (and with it this weak reference).
++                f.borrow_mut().take();
++                return;
++            }
++            crate::present_loop::FrameAction::Present => match renderer.upgrade() {
++                Some(renderer) => renderer.borrow().present(),
++                None => {
++                    state.borrow_mut().stop();
++                    f.borrow_mut().take();
++                    return;
++                }
++            },
++            crate::present_loop::FrameAction::Skip => {}
++        }
++
++        let Some(window) = web_sys::window() else {
++            f.borrow_mut().take();
++            return;
++        };
++
++        let next = {
++            let scheduled = f.borrow();
++            let closure = scheduled
++                .as_ref()
++                .expect("present closure missing from its own slot");
++            closure.as_ref().unchecked_ref::<js_sys::Function>().clone()
++        };
++
++        if window.request_animation_frame(&next).is_err() {
++            state.borrow_mut().stop();
++            f.borrow_mut().take();
++        }
+     })));
+ 
+-    let window = web_sys::window().expect("no window");
+-    window
+-        .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+-        .expect("failed to schedule the present loop");
++    let Some(window) = web_sys::window() else {
++        g.borrow_mut().take();
++        return;
++    };
++
++    let first = {
++        let scheduled = g.borrow();
++        let closure = scheduled
++            .as_ref()
++            .expect("present closure missing from its own slot");
++        closure.as_ref().unchecked_ref::<js_sys::Function>().clone()
++    };
++
++    if window.request_animation_frame(&first).is_err() {
++        g.borrow_mut().take();
++    }
+ }
+diff --git a/crates/ironrdp-web/src/image.rs b/crates/ironrdp-web/src/image.rs
+index 2df63ef..f79fcb5 100644
+--- a/crates/ironrdp-web/src/image.rs
++++ b/crates/ironrdp-web/src/image.rs
+@@ -4,21 +4,59 @@ use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+ use ironrdp::session::image::DecodedImage;
+ use ironrdp_core::WriteBuf;
+ 
++/// Horizontal overdraw accepted when widening a dirty region to whole rows:
++/// the widened upload may cover at most 1.25x the dirty region width.
++const OVERDRAW_NUMERATOR: u64 = 5;
++const OVERDRAW_DENOMINATOR: u64 = 4;
++
+ /// Copies the dirty `region` into `buffer` from its current cursor (clear it between regions).
+-/// The returned rect may be wider than `region`: the whole-rows path widens to full image width.
++/// The returned rect may be wider than `region` on the whole-rows path, but it never
++/// exceeds the 1.25x horizontal overdraw cap and is always clipped to the image bounds.
+ pub(crate) fn extract_partial_image(
+     image: &DecodedImage,
+     region: InclusiveRectangle,
+     buffer: &mut WriteBuf,
+ ) -> InclusiveRectangle {
+-    // PERF: needs actual benchmark to find a better heuristic
+-    if region.height() > 64 || region.width() > 512 {
++    let Some(region) = clip_to_image(image, region) else {
++        return InclusiveRectangle::empty();
++    };
++
++    if widens_within_overdraw_cap(image, &region) {
+         extract_whole_rows(image, region, buffer)
+     } else {
+         extract_smallest_rectangle(image, region, buffer)
+     }
+ }
+ 
++/// Intersects the dirty region with the image bounds. Regions are usually
++/// already in bounds, but a stale region after a resize/connect must never
++/// index past the framebuffer.
++fn clip_to_image(image: &DecodedImage, region: InclusiveRectangle) -> Option<InclusiveRectangle> {
++    if image.width() == 0 || image.height() == 0 {
++        return None;
++    }
++
++    let bounds = InclusiveRectangle {
++        left: 0,
++        top: 0,
++        right: image.width() - 1,
++        bottom: image.height() - 1,
++    };
++
++    region.intersect(&bounds)
++}
++
++/// Whether uploading the full rows would overdraw at most 1.25x the dirty
++/// region width (`image_width * height <= 1.25 * region_width * height`).
++/// Tall regions that cover most of the width win from row-wise copies; narrow
++/// tall strips do not, and would otherwise copy the whole image width per row.
++fn widens_within_overdraw_cap(image: &DecodedImage, region: &InclusiveRectangle) -> bool {
++    let widened = u64::from(image.width()) * u64::from(region.height()) * OVERDRAW_DENOMINATOR;
++    let cap = u64::from(region.width()) * u64::from(region.height()) * OVERDRAW_NUMERATOR;
++
++    widened <= cap
++}
++
+ // Faster for low-height and smaller images
+ fn extract_smallest_rectangle(
+     image: &DecodedImage,
+@@ -84,3 +122,101 @@ fn extract_whole_rows(image: &DecodedImage, region: InclusiveRectangle, buffer:
+         bottom: region.bottom,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use ironrdp::graphics::image_processing::PixelFormat;
++    use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
++    use ironrdp::session::image::DecodedImage;
++    use ironrdp_core::WriteBuf;
++
++    use super::extract_partial_image;
++
++    const BYTES_PER_PIXEL: usize = 4;
++
++    fn image(width: u16, height: u16) -> DecodedImage {
++        DecodedImage::new(PixelFormat::RgbA32, width, height)
++    }
++
++    fn rect(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
++        InclusiveRectangle {
++            left,
++            top,
++            right,
++            bottom,
++        }
++    }
++
++    fn extract(image: &DecodedImage, region: InclusiveRectangle) -> (InclusiveRectangle, Vec<u8>) {
++        let mut buffer = WriteBuf::new();
++        let extracted = extract_partial_image(image, region, &mut buffer);
++        (extracted, buffer.filled().to_vec())
++    }
++
++    #[test]
++    fn tall_narrow_region_keeps_the_minimal_rect() {
++        // Height > 64 used to force a full-width row copy here; the 1.25x cap
++        // keeps the 100 px strip at 100 px instead of widening to 1000 px.
++        let img = image(1000, 600);
++        let region = rect(50, 10, 149, 509);
++        let (extracted, pixels) = extract(&img, region.clone());
++
++        assert_eq!(extracted, region);
++        assert_eq!(pixels.len(), 100 * 500 * BYTES_PER_PIXEL);
++    }
++
++    #[test]
++    fn full_rows_only_within_the_overdraw_cap() {
++        // image_width == 1.25 * region_width: the cap allows whole rows.
++        let img = image(125, 100);
++        let (extracted, pixels) = extract(&img, rect(0, 0, 99, 99));
++        assert_eq!(extracted, rect(0, 0, 124, 99));
++        assert_eq!(pixels.len(), 125 * 100 * BYTES_PER_PIXEL);
++
++        // One more column overdraws past 1.25x: keep the minimal rectangle.
++        let img = image(126, 100);
++        let region = rect(0, 0, 99, 99);
++        let (extracted, pixels) = extract(&img, region.clone());
++        assert_eq!(extracted, region);
++        assert_eq!(pixels.len(), 100 * 100 * BYTES_PER_PIXEL);
++    }
++
++    #[test]
++    fn region_is_clipped_to_image_bounds() {
++        let img = image(100, 100);
++
++        // Minimal-rect path with an oversized right/bottom edge.
++        let (extracted, pixels) = extract(&img, rect(50, 50, 149, 149));
++        assert_eq!(extracted, rect(50, 50, 99, 99));
++        assert_eq!(pixels.len(), 50 * 50 * BYTES_PER_PIXEL);
++
++        // Whole-rows path whose bottom row starts past the image edge.
++        let (extracted, pixels) = extract(&img, rect(0, 90, 199, 199));
++        assert_eq!(extracted, rect(0, 90, 99, 99));
++        assert_eq!(pixels.len(), 100 * 10 * BYTES_PER_PIXEL);
++    }
++
++    #[test]
++    fn out_of_bounds_region_extracts_nothing() {
++        let img = image(100, 100);
++        let (extracted, pixels) = extract(&img, rect(200, 200, 299, 299));
++
++        assert_eq!(extracted, InclusiveRectangle::empty());
++        assert!(pixels.is_empty());
++    }
++
++    #[test]
++    fn post_resize_full_width_band_leaves_no_untouched_columns() {
++        // The first paint after a resize/connect is a full-width band. The
++        // widened rect spans 0..image_width - 1 and the buffer holds one full
++        // row per source row, so every column is uploaded. A minimal-rect
++        // blit here would leave the columns outside the strip stale.
++        let img = image(640, 480);
++        let (extracted, pixels) = extract(&img, rect(0, 0, 639, 479));
++
++        assert_eq!(extracted, rect(0, 0, 639, 479));
++        assert_eq!(extracted.width(), img.width());
++        assert_eq!(pixels.len(), 640 * 480 * BYTES_PER_PIXEL);
++        assert_eq!(pixels.as_slice(), img.data());
++    }
++}
+diff --git a/crates/ironrdp-web/src/lib.rs b/crates/ironrdp-web/src/lib.rs
+index 664e42e..7ddf21e 100644
+--- a/crates/ironrdp-web/src/lib.rs
++++ b/crates/ironrdp-web/src/lib.rs
+@@ -15,16 +15,28 @@ extern crate getrandom2 as _;
+ extern crate getrandom4 as _;
+ extern crate time as _;
+ 
++// The web client only builds for wasm32. The pure helper modules below stay
++// available on every target so their unit tests can run on the host.
++#[cfg(target_arch = "wasm32")]
+ mod canvas;
++#[cfg(target_arch = "wasm32")]
+ mod clipboard;
++#[cfg(target_arch = "wasm32")]
+ mod error;
+ mod image;
++#[cfg(target_arch = "wasm32")]
+ mod input;
++#[cfg(target_arch = "wasm32")]
+ mod network_client;
++mod present_loop;
++#[cfg(target_arch = "wasm32")]
+ mod printer;
++#[cfg(target_arch = "wasm32")]
+ mod rdp_file;
++#[cfg(target_arch = "wasm32")]
+ mod session;
+ 
++#[cfg(target_arch = "wasm32")]
+ mod wasm_bridge {
+     use tracing::debug;
+ 
+diff --git a/crates/ironrdp-web/src/present_loop.rs b/crates/ironrdp-web/src/present_loop.rs
+new file mode 100644
+index 0000000..6aef0b8
+--- /dev/null
++++ b/crates/ironrdp-web/src/present_loop.rs
+@@ -0,0 +1,123 @@
++//! Lifecycle state for the requestAnimationFrame present loop.
++//!
++//! Kept free of DOM types so the state machine can be unit tested on the host
++//! target, where the rest of this crate cannot compile (web-sys types are
++//! wasm-only at the call sites).
++
++use core::cell::RefCell;
++use std::rc::Rc;
++
++/// What the present loop should do on its next tick.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum FrameAction {
++    /// A region was uploaded since the previous tick: present it.
++    Present,
++    /// Nothing was uploaded: skip the draw call.
++    Skip,
++    /// The owning `Canvas` is gone: stop rescheduling the loop.
++    Stop,
++}
++
++/// State shared between `Canvas` and its present-loop closure.
++///
++/// `dirty` is set by the upload path and consumed by exactly one present tick.
++/// `stopped` is set when the `PresentLoop` handle owned by `Canvas` is dropped;
++/// the loop observes it on its next tick and unregisters itself.
++#[derive(Debug)]
++pub(crate) struct PresentLoopState {
++    dirty: bool,
++    stopped: bool,
++}
++
++impl PresentLoopState {
++    fn new() -> Self {
++        Self {
++            dirty: false,
++            stopped: false,
++        }
++    }
++
++    pub(crate) fn mark_dirty(&mut self) {
++        if !self.stopped {
++            self.dirty = true;
++        }
++    }
++
++    pub(crate) fn stop(&mut self) {
++        self.stopped = true;
++        self.dirty = false;
++    }
++
++    pub(crate) fn next_frame(&mut self) -> FrameAction {
++        if self.stopped {
++            FrameAction::Stop
++        } else if self.dirty {
++            self.dirty = false;
++            FrameAction::Present
++        } else {
++            FrameAction::Skip
++        }
++    }
++}
++
++/// Handle owned by `Canvas`. Dropping it stops the present loop.
++pub(crate) struct PresentLoop {
++    state: Rc<RefCell<PresentLoopState>>,
++}
++
++impl PresentLoop {
++    pub(crate) fn new() -> Self {
++        Self {
++            state: Rc::new(RefCell::new(PresentLoopState::new())),
++        }
++    }
++
++    pub(crate) fn mark_dirty(&self) {
++        self.state.borrow_mut().mark_dirty();
++    }
++
++    pub(crate) fn shared_state(&self) -> Rc<RefCell<PresentLoopState>> {
++        Rc::clone(&self.state)
++    }
++}
++
++impl Drop for PresentLoop {
++    fn drop(&mut self) {
++        self.state.borrow_mut().stop();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{FrameAction, PresentLoop, PresentLoopState};
++
++    #[test]
++    fn present_loop_skips_clean_frames() {
++        let mut state = PresentLoopState::new();
++        assert_eq!(state.next_frame(), FrameAction::Skip);
++        assert_eq!(state.next_frame(), FrameAction::Skip);
++    }
++
++    #[test]
++    fn present_loop_presents_once_per_upload() {
++        let mut state = PresentLoopState::new();
++        state.mark_dirty();
++        assert_eq!(state.next_frame(), FrameAction::Present);
++        assert_eq!(state.next_frame(), FrameAction::Skip);
++    }
++
++    #[test]
++    fn present_loop_stops_after_the_owner_is_dropped() {
++        let owner = PresentLoop::new();
++        let loop_state = owner.shared_state();
++        owner.mark_dirty();
++        assert_eq!(loop_state.borrow_mut().next_frame(), FrameAction::Present);
++
++        drop(owner);
++
++        assert_eq!(loop_state.borrow_mut().next_frame(), FrameAction::Stop);
++        // A late upload must not resurrect a stopped loop.
++        loop_state.borrow_mut().mark_dirty();
++        assert_eq!(loop_state.borrow_mut().next_frame(), FrameAction::Stop);
++    }
++}

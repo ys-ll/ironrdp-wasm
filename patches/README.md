@@ -58,3 +58,25 @@ Windows Server 2012 sends desktop frames over EGFX in this configuration;
 without the channel, authentication succeeds but the web canvas stays black.
 The channel uses the built-in non-H.264 codecs and reuses the session's
 existing compositor-to-canvas path. Display Control remains optional.
+
+## 0007-stop-idle-present-loop-and-cap-row-overdraw.patch
+
+Fixes two RDP rendering inefficiencies in the WebGL2 web client:
+
+- The requestAnimationFrame present loop ran for the page lifetime and
+  presented on every tick even when nothing had been uploaded, and every
+  reconnect leaked a loop together with its renderer and GPU texture. The
+  loop now holds only a `Weak` renderer reference, presents only after an
+  upload, and stops itself once the owning `Canvas` is dropped. The loop
+  state machine lives in a new `present_loop.rs`, unit-testable on the host.
+- Dirty-region extraction widened tall or large updates to full image rows
+  whenever `height > 64 || width > 512`, so a caret or text-line update paid
+  a full-width copy. Whole-row widening is now gated on a 1.25x horizontal
+  overdraw cap, and regions are clipped to the framebuffer bounds before
+  extraction, so stale regions after a resize can no longer index past the
+  framebuffer.
+
+Both fixes are self-contained to `canvas.rs`, `image.rs`, `lib.rs`, and the
+new `present_loop.rs`, with no overlap with the other patches. Regenerate
+against a fresh IronRDP checkout if `git apply` fails after an upstream
+change.
